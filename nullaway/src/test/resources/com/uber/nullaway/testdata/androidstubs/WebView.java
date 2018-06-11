@@ -20,27 +20,13 @@
  * THE SOFTWARE.
  */
 
-package com.uber.nullaway.handlers;
+// STUB CLASS FOR PURPOSES OF REGRESSION TESTING ONLY
 
-import com.google.common.collect.ImmutableList;
+package android.webkit;
 
-/** Utility static methods for the handlers package. */
-public class Handlers {
+public class WebView {
 
-  private Handlers() {}
-
-  /**
-   * Builds the default handler for the checker.
-   *
-   * @return A {@code CompositeHandler} including the standard handlers for the nullness checker.
-   */
-  public static Handler buildDefault() {
-    // In the future we can add LibraryModels functionality here, and even plug-in handlers.
-    return new CompositeHandler(
-        ImmutableList.of(
-            new LibraryModelsHandler(),
-            new RxNullabilityPropagator(),
-            new ContractHandler(),
-            new ApacheThriftIsSetHandler()));
+  public String getUrl() {
+    return null;
   }
 }

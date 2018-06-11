@@ -33,6 +33,7 @@ import com.uber.nullaway.Config;
 import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.handlers.Handler;
+import com.uber.nullaway.handlers.Handler.NullnessHint;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -158,6 +159,21 @@ public class AccessPathNullnessPropagation
     return input::getValueOfSubNode;
   }
 
+  /**
+   * @param node CFG node
+   * @return if node is an {@link AssignmentNode} unwraps it to its LHS. otherwise returns node
+   */
+  private static Node unwrapAssignExpr(Node node) {
+    if (node instanceof AssignmentNode) {
+      // in principle, we could separately handle the LHS and RHS and add new facts
+      // about both.  For now, just handle the LHS as that seems like the more common
+      // case (see https://github.com/uber/NullAway/issues/97)
+      return ((AssignmentNode) node).getTarget();
+    } else {
+      return node;
+    }
+  }
+
   @Override
   public NullnessStore<Nullness> initialStore(
       UnderlyingAST underlyingAST, List<LocalVariableNode> parameters) {
@@ -189,14 +205,14 @@ public class AccessPathNullnessPropagation
       Nullness assumed;
       // we treat lambda parameters differently; they "inherit" the nullability of the
       // corresponding functional interface parameter, unless they are explicitly annotated
-      if (Nullness.hasNullableAnnotation(element)) {
+      if (Nullness.hasNullableAnnotation((Symbol) element)) {
         assumed = NULLABLE;
-      } else if (NullabilityUtil.lambdaParamIsExplicitlyTyped(variableTree)) {
+      } else if (!NullabilityUtil.lambdaParamIsImplicitlyTyped(variableTree)) {
         // the parameter has a declared type with no @Nullable annotation
         // treat as non-null
         assumed = NONNULL;
       } else {
-        if (fromUnannotatedPackage(fiMethodSymbol)) {
+        if (NullabilityUtil.isUnannotated(fiMethodSymbol, config)) {
           // optimistically assume parameter is non-null
           assumed = NONNULL;
         } else {
@@ -209,18 +225,12 @@ public class AccessPathNullnessPropagation
     return result.build();
   }
 
-  private boolean fromUnannotatedPackage(Symbol symbol) {
-    Symbol.ClassSymbol outermostClassSymbol = NullabilityUtil.getOutermostClassSymbol(symbol);
-
-    return !config.fromAnnotatedPackage(outermostClassSymbol.toString());
-  }
-
   private NullnessStore<Nullness> methodInitialStore(
       UnderlyingAST underlyingAST, List<LocalVariableNode> parameters) {
     NullnessStore.Builder<Nullness> result = NullnessStore.<Nullness>empty().toBuilder();
     for (LocalVariableNode param : parameters) {
       Element element = param.getElement();
-      Nullness assumed = Nullness.hasNullableAnnotation(element) ? NULLABLE : NONNULL;
+      Nullness assumed = Nullness.hasNullableAnnotation((Symbol) element) ? NULLABLE : NONNULL;
       result.setInformation(AccessPath.fromLocal(param), assumed);
     }
     result = handler.onDataflowInitialStore(underlyingAST, parameters, result);
@@ -488,61 +498,22 @@ public class AccessPathNullnessPropagation
     Updates equalBranchUpdates = equalTo ? thenUpdates : elseUpdates;
     Updates notEqualBranchUpdates = equalTo ? elseUpdates : thenUpdates;
 
-    if (leftNode instanceof LocalVariableNode) {
-      LocalVariableNode localVar = (LocalVariableNode) leftNode;
-      equalBranchUpdates.set(localVar, equalBranchValue);
+    Node realLeftNode = unwrapAssignExpr(leftNode);
+    Node realRightNode = unwrapAssignExpr(rightNode);
+
+    AccessPath leftAP = AccessPath.getAccessPathForNodeWithMapGet(realLeftNode, types);
+    if (leftAP != null) {
+      equalBranchUpdates.set(leftAP, equalBranchValue);
       notEqualBranchUpdates.set(
-          localVar, leftVal.greatestLowerBound(rightVal.deducedValueWhenNotEqual()));
+          leftAP, leftVal.greatestLowerBound(rightVal.deducedValueWhenNotEqual()));
     }
 
-    if (rightNode instanceof LocalVariableNode) {
-      LocalVariableNode localVar = (LocalVariableNode) rightNode;
-      equalBranchUpdates.set(localVar, equalBranchValue);
+    AccessPath rightAP = AccessPath.getAccessPathForNodeWithMapGet(realRightNode, types);
+    if (rightAP != null) {
+      equalBranchUpdates.set(rightAP, equalBranchValue);
       notEqualBranchUpdates.set(
-          localVar, rightVal.greatestLowerBound(leftVal.deducedValueWhenNotEqual()));
+          rightAP, rightVal.greatestLowerBound(leftVal.deducedValueWhenNotEqual()));
     }
-
-    if (isAnalyzeableFieldAccess(leftNode)) {
-      // noinspection ConstantConditions
-      FieldAccessNode fieldAccess = (FieldAccessNode) leftNode;
-      equalBranchUpdates.set(fieldAccess, equalBranchValue);
-      notEqualBranchUpdates.set(
-          fieldAccess, leftVal.greatestLowerBound(rightVal.deducedValueWhenNotEqual()));
-    }
-
-    if (isAnalyzeableFieldAccess(rightNode)) {
-      // noinspection ConstantConditions
-      FieldAccessNode fieldAccess = (FieldAccessNode) rightNode;
-      equalBranchUpdates.set(fieldAccess, equalBranchValue);
-      notEqualBranchUpdates.set(
-          fieldAccess, rightVal.greatestLowerBound(leftVal.deducedValueWhenNotEqual()));
-    }
-
-    if (isAnalyzeableMethodCall(leftNode)) {
-      // noinspection ConstantConditions
-      MethodInvocationNode invNode = (MethodInvocationNode) leftNode;
-      equalBranchUpdates.set(invNode, equalBranchValue);
-      notEqualBranchUpdates.set(
-          invNode, leftVal.greatestLowerBound(rightVal.deducedValueWhenNotEqual()));
-    }
-
-    if (isAnalyzeableMethodCall(rightNode)) {
-      // noinspection ConstantConditions
-      MethodInvocationNode invNode = (MethodInvocationNode) rightNode;
-      equalBranchUpdates.set(invNode, equalBranchValue);
-      notEqualBranchUpdates.set(
-          invNode, rightVal.greatestLowerBound(leftVal.deducedValueWhenNotEqual()));
-    }
-  }
-
-  private static boolean isAnalyzeableFieldAccess(Node node) {
-    return node instanceof FieldAccessNode
-        && AccessPath.fromFieldAccess((FieldAccessNode) node) != null;
-  }
-
-  private boolean isAnalyzeableMethodCall(Node node) {
-    return node instanceof MethodInvocationNode
-        && AccessPath.fromMethodCall((MethodInvocationNode) node, types) != null;
   }
 
   @Override
@@ -620,12 +591,9 @@ public class AccessPathNullnessPropagation
    * the updates
    */
   private void setNonnullIfAnalyzeable(Updates updates, Node node) {
-    if (node instanceof LocalVariableNode) {
-      updates.set((LocalVariableNode) node, NONNULL);
-    } else if (isAnalyzeableFieldAccess(node)) {
-      updates.set((FieldAccessNode) node, NONNULL);
-    } else if (isAnalyzeableMethodCall(node)) {
-      updates.set((MethodInvocationNode) node, NONNULL);
+    AccessPath ap = AccessPath.getAccessPathForNodeWithMapGet(node, types);
+    if (ap != null) {
+      updates.set(ap, NONNULL);
     }
   }
 
@@ -677,7 +645,6 @@ public class AccessPathNullnessPropagation
     ReadableUpdates updates = new ReadableUpdates();
     Symbol symbol = ASTHelpers.getSymbol(fieldAccessNode.getTree());
     setReceiverNonnull(updates, fieldAccessNode.getReceiver(), symbol);
-    VariableElement element = fieldAccessNode.getElement();
     Nullness nullness = Nullness.NULLABLE;
     if (!NullabilityUtil.mayBeNullFieldFromType(symbol, config)) {
       nullness = NONNULL;
@@ -747,7 +714,9 @@ public class AccessPathNullnessPropagation
       TransferInput<Nullness, NullnessStore<Nullness>> input) {
     handler.onDataflowVisitLambdaResultExpression(
         resultNode.getTree(), input.getThenStore(), input.getElseStore());
-    return noStoreChanges(NULLABLE, input);
+    SubNodeValues values = values(input);
+    Nullness nullness = values.valueOfSubNode(resultNode.getResult());
+    return noStoreChanges(nullness, input);
   }
 
   @Override
@@ -830,9 +799,10 @@ public class AccessPathNullnessPropagation
     setReceiverNonnull(bothUpdates, node.getTarget().getReceiver(), callee);
     setNullnessForMapCalls(
         node, callee, node.getArguments(), types, values(input), thenUpdates, bothUpdates);
-    Nullness nullnessFromHandlers =
-        handler.onDataflowVisitMethodInvocation(node, types, thenUpdates, elseUpdates, bothUpdates);
-    Nullness nullness = returnValueNullness(node, input, nullnessFromHandlers);
+    NullnessHint nullnessHint =
+        handler.onDataflowVisitMethodInvocation(
+            node, types, values(input), thenUpdates, elseUpdates, bothUpdates);
+    Nullness nullness = returnValueNullness(node, input, nullnessHint);
     if (booleanReturnType(node)) {
       ResultingStore thenStore = updateStore(input.getThenStore(), thenUpdates, bothUpdates);
       ResultingStore elseStore = updateStore(input.getElseStore(), elseUpdates, bothUpdates);
@@ -876,16 +846,23 @@ public class AccessPathNullnessPropagation
   Nullness returnValueNullness(
       MethodInvocationNode node,
       TransferInput<Nullness, NullnessStore<Nullness>> input,
-      Nullness returnValueNullness) {
+      NullnessHint returnValueNullnessHint) {
     // NULLABLE is our default
     Nullness nullness;
-    if (node != null && returnValueNullness == NULLABLE) {
+    if (node != null && returnValueNullnessHint == NullnessHint.FORCE_NONNULL) {
+      // A handler says this is definitely non-null; trust it. Note that FORCE_NONNULL is quite
+      // dangerous, since it
+      // ignores our analysis' own best judgement, so both this value and the annotations that cause
+      // it (e.g.
+      // @Contract ) should be used with care.
+      nullness = NONNULL;
+    } else if (node != null && returnValueNullnessHint == NullnessHint.HINT_NULLABLE) {
       // we have a model saying return value is nullable.
       // still, rely on dataflow fact if there is one available
       nullness = input.getRegularStore().valueOfMethodCall(node, types, NULLABLE);
     } else if (node == null
         || methodReturnsNonNull.test(node)
-        || !Nullness.hasNullableAnnotation(node.getTarget().getMethod())) {
+        || !Nullness.hasNullableAnnotation((Symbol) node.getTarget().getMethod())) {
       // definite non-null return
       nullness = NONNULL;
     } else {
@@ -975,8 +952,8 @@ public class AccessPathNullnessPropagation
    * Provides the previously computed nullness values of descendant nodes. All descendant nodes have
    * already been assigned a value, if only the default of {@code NULLABLE}.
    */
-  interface SubNodeValues {
-    Nullness valueOfSubNode(Node node);
+  public interface SubNodeValues {
+    public Nullness valueOfSubNode(Node node);
   }
 
   private static final class ResultingStore {

@@ -22,23 +22,26 @@
 
 package com.uber.nullaway;
 
-import com.google.common.collect.Iterables;
+import com.google.common.base.Preconditions;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
+import com.sun.tools.javac.code.Attribute;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.code.TargetType;
 import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.util.JCDiagnostic;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import javax.lang.model.element.AnnotationMirror;
-import javax.lang.model.element.Element;
-import javax.lang.model.type.TypeMirror;
 
 /** Helpful utility methods for nullability analysis. */
 public class NullabilityUtil {
@@ -46,30 +49,31 @@ public class NullabilityUtil {
   private NullabilityUtil() {}
 
   /**
-   * finds the corresponding functional interface method for a lambda expression
+   * finds the corresponding functional interface method for a lambda expression or method reference
    *
-   * @param tree the lambda expression
+   * @param tree the lambda expression or method reference
    * @return the functional interface method
    */
-  public static Symbol.MethodSymbol getFunctionalInterfaceMethod(
-      LambdaExpressionTree tree, Types types) {
-    Type funcInterfaceType = ((JCTree.JCLambda) tree).type;
+  public static Symbol.MethodSymbol getFunctionalInterfaceMethod(ExpressionTree tree, Types types) {
+    Preconditions.checkArgument(
+        (tree instanceof LambdaExpressionTree) || (tree instanceof MemberReferenceTree));
+    Type funcInterfaceType = ((JCTree.JCFunctionalExpression) tree).type;
     return (Symbol.MethodSymbol) types.findDescriptorSymbol(funcInterfaceType.tsym);
   }
 
   /**
-   * determines whether a lambda parameter has an explicit type declaration
+   * determines whether a lambda parameter is missing an explicit type declaration
    *
    * @param lambdaParameter the parameter
-   * @return true if there is a type declaration, false otherwise
+   * @return true if there is no type declaration, false otherwise
    */
-  public static boolean lambdaParamIsExplicitlyTyped(VariableTree lambdaParameter) {
+  public static boolean lambdaParamIsImplicitlyTyped(VariableTree lambdaParameter) {
     // kind of a hack; the "preferred position" seems to be the position
     // of the variable name.  if this differs from the start position, it
     // means there is an explicit type declaration
     JCDiagnostic.DiagnosticPosition diagnosticPosition =
         (JCDiagnostic.DiagnosticPosition) lambdaParameter;
-    return diagnosticPosition.getStartPosition() != diagnosticPosition.getPreferredPosition();
+    return diagnosticPosition.getStartPosition() == diagnosticPosition.getPreferredPosition();
   }
 
   /**
@@ -125,16 +129,46 @@ public class NullabilityUtil {
   }
 
   /**
-   * @param element the element
-   * @return all annotations on the element and on the type of the element
+   * NOTE: this method does not work for getting all annotations of parameters of methods from class
+   * files. For that case, use {@link #getAllAnnotationsForParameter(Symbol.MethodSymbol, int)}
+   *
+   * @param symbol the symbol
+   * @return all annotations on the symbol and on the type of the symbol
    */
-  public static Iterable<? extends AnnotationMirror> getAllAnnotations(Element element) {
+  public static Stream<? extends AnnotationMirror> getAllAnnotations(Symbol symbol) {
     // for methods, we care about annotations on the return type, not on the method type itself
-    TypeMirror typeMirror =
-        element instanceof Symbol.MethodSymbol
-            ? ((Symbol.MethodSymbol) element).getReturnType()
-            : element.asType();
-    return Iterables.concat(element.getAnnotationMirrors(), typeMirror.getAnnotationMirrors());
+    Stream<? extends AnnotationMirror> typeUseAnnotations = getTypeUseAnnotations(symbol);
+    return Stream.concat(symbol.getAnnotationMirrors().stream(), typeUseAnnotations);
+  }
+
+  /**
+   * Works for method parameters defined either in source or in class files
+   *
+   * @param symbol the method symbol
+   * @param paramInd index of the parameter
+   * @return all declaration and type-use annotations for the parameter
+   */
+  public static Stream<? extends AnnotationMirror> getAllAnnotationsForParameter(
+      Symbol.MethodSymbol symbol, int paramInd) {
+    Symbol.VarSymbol varSymbol = symbol.getParameters().get(paramInd);
+    return Stream.concat(
+        varSymbol.getAnnotationMirrors().stream(),
+        symbol
+            .getRawTypeAttributes()
+            .stream()
+            .filter(
+                t ->
+                    t.position.type.equals(TargetType.METHOD_FORMAL_PARAMETER)
+                        && t.position.parameter_index == paramInd));
+  }
+
+  private static Stream<? extends AnnotationMirror> getTypeUseAnnotations(Symbol symbol) {
+    Stream<Attribute.TypeCompound> rawTypeAttributes = symbol.getRawTypeAttributes().stream();
+    if (symbol instanceof Symbol.MethodSymbol) {
+      // for methods, we want the type-use annotations on the return type
+      return rawTypeAttributes.filter((t) -> t.position.type.equals(TargetType.METHOD_RETURN));
+    }
+    return rawTypeAttributes;
   }
 
   /**
@@ -149,18 +183,18 @@ public class NullabilityUtil {
     }
     return !(symbol.getSimpleName().toString().equals("class")
             || symbol.isEnum()
-            || fromUnannotatedPackage(symbol, config))
+            || isUnannotated(symbol, config))
         && Nullness.hasNullableAnnotation(symbol);
   }
 
   /**
    * @param symbol symbol for entity
    * @param config NullAway config
-   * @return true if symbol represents an entity from a package not marked as annotated in the
-   *     config; false otherwise
+   * @return true if symbol represents an entity from a class that is unannotated; false otherwise
    */
-  public static boolean fromUnannotatedPackage(Symbol symbol, Config config) {
+  public static boolean isUnannotated(Symbol symbol, Config config) {
     Symbol.ClassSymbol outermostClassSymbol = getOutermostClassSymbol(symbol);
-    return !config.fromAnnotatedPackage(outermostClassSymbol.toString());
+    return !config.fromAnnotatedPackage(outermostClassSymbol)
+        || config.isUnannotatedClass(outermostClassSymbol);
   }
 }

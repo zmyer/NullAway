@@ -13,28 +13,38 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 plugins {
-  id "net.ltgt.apt" version "0.13"
   id "net.ltgt.errorprone" version "0.0.13"
   id "java"
+  id "application"
 }
 
 sourceCompatibility = "1.8"
 targetCompatibility = "1.8"
 
+mainClassName = "com.uber.nullaway.benchmark.NullAwayBenchmarkHarness"
+
+configurations.maybeCreate("epJavac")
+
 dependencies {
-    apt project(path: ":nullaway", configuration: "shadow")
-    apt project(path: ":sample-library-model")
+    compile deps.build.errorProneCore
+    compile project(path: ":nullaway", configuration: "shadow")
 
     errorprone deps.build.errorProneCore
 
-    compileOnly deps.build.jsr305Annotations
-    testCompile deps.test.junit4
+    epJavac deps.build.errorProneCore
+
 }
 
-tasks.withType(JavaCompile) {
-  if (!name.toLowerCase().contains("test")) {
-    options.compilerArgs += ["-Xep:NullAway:ERROR", "-XepOpt:NullAway:AnnotatedPackages=com.uber"]
-  }
-} 
+applicationDefaultJvmArgs = ["-Xbootclasspath/p:${configurations.epJavac.asPath}"]
+
+run {
+    if (project.hasProperty("appArgs")) {
+        args(appArgs.split(' '))
+    }
+}
+compileJava {
+    options.compilerArgs += ["-Xlint:unchecked", "-Xlint:rawtypes", "-Werror"]
+}
+
+

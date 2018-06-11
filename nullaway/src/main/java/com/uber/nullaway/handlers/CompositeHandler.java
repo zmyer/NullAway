@@ -28,6 +28,7 @@ import com.google.errorprone.VisitorState;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ReturnTree;
@@ -85,6 +86,17 @@ class CompositeHandler implements Handler {
   }
 
   @Override
+  public void onMatchMethodReference(
+      NullAway analysis,
+      MemberReferenceTree tree,
+      VisitorState state,
+      Symbol.MethodSymbol methodSymbol) {
+    for (Handler h : handlers) {
+      h.onMatchMethodReference(analysis, tree, state, methodSymbol);
+    }
+  }
+
+  @Override
   public void onMatchMethodInvocation(
       NullAway analysis,
       MethodInvocationTree tree,
@@ -138,22 +150,21 @@ class CompositeHandler implements Handler {
   }
 
   @Override
-  public Nullness onDataflowVisitMethodInvocation(
+  public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
       Types types,
+      AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
       AccessPathNullnessPropagation.Updates bothUpdates) {
-    Nullness nullness = Nullness.NONNULL;
+    NullnessHint nullnessHint = NullnessHint.UNKNOWN;
     for (Handler h : handlers) {
-      Nullness n =
-          h.onDataflowVisitMethodInvocation(node, types, thenUpdates, elseUpdates, bothUpdates);
-      // If any handler says this is @Nullable, then it is @Nullable
-      if (n == Nullness.NULLABLE) {
-        nullness = Nullness.NULLABLE;
-      }
+      NullnessHint n =
+          h.onDataflowVisitMethodInvocation(
+              node, types, inputs, thenUpdates, elseUpdates, bothUpdates);
+      nullnessHint = nullnessHint.merge(n);
     }
-    return nullness;
+    return nullnessHint;
   }
 
   @Override

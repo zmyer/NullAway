@@ -1,6 +1,88 @@
 Changelog
 =========
 
+Version 0.4.6
+-------------
+* Fix a couple of Thrift issues (#164)
+* Don't report initialization warnings on fields for @ExternalInit classes with 
+  no initializer methods (#166)
+
+Version 0.4.5
+-------------
+* Fix bug with handling Thrift `TBase.isSet()` calls (#161)
+
+Version 0.4.4
+-------------
+* add UnannotatedClasses option (#160)
+
+Version 0.4.3
+-------------
+* properly handle compound assignments (#157)
+* handle unboxing of array index expression (#158)
+
+Version 0.4.2
+-------------
+* Upgrade Checker Framework dependency to upstream version 2.5.0 (#150)
+* Don't crash on field initialization inside an enum (#146)
+* Properly find super constructor for anonymous classes (#147)
+* Add a Handler for supporting isSetXXXX() methods in Thrift-generated code (#148)
+* Use `@SuppressWarnings` as autofix in a couple more places (#149)
+
+Version 0.4.1
+-------------
+* Initial RxNullabilityPropagator support for method
+  references. (#141)
+
+Version 0.4.0
+-------------
+* Support for checking uses of method references (#139, #140).  Note
+  that this may lead to new NullAway warnings being reported for code
+  that previously passed.
+* Add support for `Observable.doOnNext` to RxNullabilityPropagator
+  (#137)
+
+Version 0.3.7
+-------------
+* Small bug fix in `@Contract` support (#136)
+
+Version 0.3.6
+-------------
+* Support for a subset of JetBrains `@Contract` annotations (#129)
+* Built-in support for JUnit 4/5 assertNotNull, Objects.requireNonNull
+* Fix crash when using try-with-resource with an empty try block. (#135)
+
+Version 0.3.5
+-------------
+* Support for treating `@Generated`-annotated classes as unannotated (#127) 
+
+Version 0.3.4
+-------------
+* Support for classes with external initialization (#124)
+
+Version 0.3.3
+-------------
+* Made dependence on Guava explicit (#120)
+* Significantly improved handling of try/finally (#123)
+
+Version 0.3.2
+-------------
+* Just fixed a Gradle configuration problem
+
+Version 0.3.1 (never made it to Maven Central)
+-------------
+* Bug fixes (#107, #108, #110, #112)
+
+Version 0.3.0
+-------------
+* Update library models to require full method signatures rather than
+  just method names (#90).  This is an API-breaking change; if you've
+  written your own library models, they will need to be updated.
+* Support @BeforeEach and @BeforeAll as initializer annotations, and
+  @Inject and @LazyInit as excluded field annotations. (#81)
+* Support Checker Framework's @NullableDecl annotation (#84)
+* Add models for java.util.Deque methods (#86)
+* Add model for WebView.getUrl() (#91)
+
 Version 0.2.2
 -------------
 * minor fixes (#69, #71)

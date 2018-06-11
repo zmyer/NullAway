@@ -52,12 +52,17 @@ public class DummyOptionsConfig implements Config {
   public DummyOptionsConfig() {}
 
   @Override
-  public boolean fromAnnotatedPackage(String className) {
+  public boolean fromAnnotatedPackage(Symbol.ClassSymbol symbol) {
     throw new IllegalStateException(error_msg);
   }
 
   @Override
   public boolean isExcludedClass(String className) {
+    throw new IllegalStateException(error_msg);
+  }
+
+  @Override
+  public boolean isUnannotatedClass(Symbol.ClassSymbol symbol) {
     throw new IllegalStateException(error_msg);
   }
 
@@ -73,6 +78,11 @@ public class DummyOptionsConfig implements Config {
 
   @Override
   public boolean isKnownInitializerMethod(Symbol.MethodSymbol methodSymbol) {
+    throw new IllegalStateException(error_msg);
+  }
+
+  @Override
+  public boolean isExternalInitClassAnnotation(String annotationName) {
     throw new IllegalStateException(error_msg);
   }
 

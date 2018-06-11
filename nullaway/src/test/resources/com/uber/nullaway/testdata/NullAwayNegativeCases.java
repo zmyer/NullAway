@@ -28,11 +28,14 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.uber.nullaway.testdata.unannotated.UnannotatedClass;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import org.checkerframework.checker.nullness.compatqual.NullableDecl;
 
 public class NullAwayNegativeCases {
 
@@ -43,6 +46,16 @@ public class NullAwayNegativeCases {
   public Object assignmentExpression() {
     Object x = null;
     return (x = new Object());
+  }
+
+  public void assignmentExpression2(@Nullable String[] a0) {
+    String[] a1;
+    Inner inner = new Inner();
+    if (((a1 = a0) != null) && (a1.length > 0)) {}
+
+    if ((null != (a1 = a0)) && (a1.length > 0)) {}
+
+    if (((inner.f1 = a0) != null) && (((String[]) inner.f1).length > 0)) {}
   }
 
   @Nullable
@@ -511,6 +524,11 @@ public class NullAwayNegativeCases {
     o.toString();
   }
 
+  static void requireNonNull(@Nullable Object o) {
+    Objects.requireNonNull(o);
+    o.toString();
+  }
+
   static void isEmpty(@Nullable String s) {
     if (!Strings.isNullOrEmpty(s)) {
       s.hashCode();
@@ -679,6 +697,37 @@ public class NullAwayNegativeCases {
     }
   }
 
+  static class CFNullableDecl {
+
+    @NullableDecl String cfNullableString;
+
+    CFNullableDecl() {}
+
+    static int fizz(@NullableDecl String str) {
+      if (str != null) {
+        return str.hashCode();
+      }
+      return 10;
+    }
+
+    static void bizz() {
+      fizz(null);
+    }
+
+    @NullableDecl
+    Object retNullMaybe() {
+      return null;
+    }
+  }
+
+  static class CFExtends2 extends CFNullableDecl {
+
+    @Override
+    Object retNullMaybe() {
+      return new Object();
+    }
+  }
+
   static class ExcNullField {
 
     void foo() {
@@ -694,6 +743,63 @@ public class NullAwayNegativeCases {
     void weird() {
       Class klazz = int.class;
       klazz.hashCode();
+    }
+  }
+
+  static class TestAnon {
+
+    TestAnon(@Nullable Object p) {}
+  }
+
+  static TestAnon testAnon(@Nullable Object q) {
+    return new TestAnon(q) {};
+  }
+
+  static class TestAnon2<T> {
+
+    TestAnon2(@Nullable List<? extends T> q) {}
+  }
+
+  static <Q> TestAnon2<Q> testAnon2(@Nullable List<Q> q) {
+    return new TestAnon2<Q>(q) {};
+  }
+
+  static class TestAnon3 {
+
+    TestAnon3(@Nullable Integer p) {}
+
+    TestAnon3(String p) {}
+  }
+
+  static TestAnon3 testAnon3(@Nullable Integer q) {
+    return new TestAnon3(q) {};
+  }
+
+  // https://github.com/uber/NullAway/issues/104
+
+  static class TwoParamIterator<T, R> implements Iterator<T> {
+    @Override
+    public boolean hasNext() {
+      return false;
+    }
+
+    @Override
+    public T next() {
+      return (T) new Object();
+    }
+  }
+
+  static class TwoParamCollection<T, R> implements Iterable<T> {
+    @Override
+    public TwoParamIterator<T, R> iterator() {
+      return new TwoParamIterator<T, R>();
+    }
+  }
+
+  static void testTwoParamIter() {
+    TwoParamCollection<String, String> c = new TwoParamCollection<>();
+    for (String s : c) {
+      s.hashCode();
     }
   }
 }

@@ -22,14 +22,25 @@
 
 package com.uber.nullaway.testdata;
 
+import android.webkit.WebView;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedSet;
+import com.google.common.collect.Iterables;
 import java.io.File;
 import java.lang.ref.WeakReference;
+import java.net.URLClassLoader;
 import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.annotation.Nullable;
+import javax.lang.model.element.Element;
+import javax.lang.model.util.Elements;
 
 public class NullAwayNativeModels {
 
@@ -190,12 +201,40 @@ public class NullAwayNativeModels {
     }
   }
 
+  static void failIfNull(@Nullable Object o1, @Nullable Object o2) {
+    org.junit.Assert.assertNotNull(o1);
+    o1.toString();
+    org.junit.Assert.assertNotNull("Null!", o2);
+    o2.toString();
+    org.junit.jupiter.api.Assertions.assertNotNull(o1);
+    o1.toString();
+    org.junit.jupiter.api.Assertions.assertNotNull(o2, "Null!");
+    o2.toString();
+    org.junit.jupiter.api.Assertions.assertNotNull(o2, () -> "Null!");
+    o2.toString();
+  }
+
   static void nonNullParameters() {
     // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
     NullAwayNativeModels.class.getResource(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    NullAwayNativeModels.class.isAssignableFrom(null);
     String s = null;
     // BUG: Diagnostic contains: passing @Nullable parameter 's' where @NonNull is required
     File f = new File(s);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    URLClassLoader.newInstance(null, NullAwayNativeModels.class.getClassLoader());
+  }
+
+  static void elementStuff(Element e, Elements elems) {
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    e.getAnnotation(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    elems.getPackageElement(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    elems.getTypeElement(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    elems.getDocComment(null);
   }
 
   static void arrayDequeStuff() {
@@ -216,5 +255,57 @@ public class NullAwayNativeModels {
     d.push(null);
     // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
     d.toArray(null);
+    // this should be fine
+    d.toArray();
+  }
+
+  static void dequeStuff() {
+    Deque<Object> d = new ArrayDeque<>();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.add(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.addFirst(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.addLast(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.offerFirst(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.offerLast(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.offer(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.push(null);
+    // BUG: Diagnostic contains: passing @Nullable parameter 'null' where @NonNull is required
+    d.toArray(null);
+  }
+
+  static void guavaStuff() {
+    Collection<String> c = null;
+    Object o = null;
+    // BUG: Diagnostic contains: passing @Nullable parameter 'c' where @NonNull is required
+    ImmutableList.builder().addAll(c).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'o' where @NonNull is required
+    ImmutableList.builder().add(o).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'c' where @NonNull is required
+    ImmutableSet.builder().addAll(c).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'o' where @NonNull is required
+    ImmutableSet.builder().add(o).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'c' where @NonNull is required
+    ImmutableSortedSet.builder().addAll(c).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'o' where @NonNull is required
+    ImmutableSortedSet.builder().add(o).build();
+    // BUG: Diagnostic contains: passing @Nullable parameter 'c' where @NonNull is required
+    Iterables.getFirst(c, "hi");
+  }
+
+  static void androidStuff() {
+    android.webkit.WebView webView = new WebView();
+    // BUG: Diagnostic contains: dereferenced expression
+    webView.getUrl().toString();
+    String s = null;
+    if (!android.text.TextUtils.isEmpty(s)) {
+      // no warning due to isEmpty check
+      s.hashCode();
+    }
   }
 }

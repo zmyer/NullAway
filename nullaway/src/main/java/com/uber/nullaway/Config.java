@@ -34,7 +34,7 @@ public interface Config {
    *     according to our convention (every possibly null parameter / return / field
    *     annotated @Nullable), false otherwise
    */
-  boolean fromAnnotatedPackage(String className);
+  boolean fromAnnotatedPackage(Symbol.ClassSymbol symbol);
 
   /**
    * @param className fully-qualified class name
@@ -42,6 +42,13 @@ public interface Config {
    *     false otherwise
    */
   boolean isExcludedClass(String className);
+
+  /**
+   * @param className fully-qualified class name
+   * @return true if the class should be treated as unannotated (in spite of being in an annotated
+   *     package)
+   */
+  boolean isUnannotatedClass(Symbol.ClassSymbol symbol);
 
   /**
    * @param annotationName fully-qualified annotation name
@@ -75,6 +82,15 @@ public interface Config {
    * @return true if the method is a known initializer
    */
   boolean isKnownInitializerMethod(Symbol.MethodSymbol methodSymbol);
+
+  /**
+   * Checks if annotation marks an "external-init class," i.e., a class where some external
+   * framework initializes object fields after invoking the zero-argument constructor.
+   *
+   * @param annotationName fully-qualified annotation name
+   * @return true if classes with the annotation are external-init
+   */
+  boolean isExternalInitClassAnnotation(String annotationName);
 
   /**
    * @return true if the null checker should suggest adding warning suppressions. Only useful for

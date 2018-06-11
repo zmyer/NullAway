@@ -56,6 +56,7 @@ import com.sun.source.tree.AssignmentTree;
 import com.sun.source.tree.BinaryTree;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompoundAssignmentTree;
 import com.sun.source.tree.ConditionalExpressionTree;
 import com.sun.source.tree.ExpressionStatementTree;
 import com.sun.source.tree.ExpressionTree;
@@ -63,6 +64,7 @@ import com.sun.source.tree.ForLoopTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.IfTree;
 import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
@@ -72,6 +74,7 @@ import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.ReturnTree;
 import com.sun.source.tree.StatementTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TryTree;
 import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.UnaryTree;
 import com.sun.source.tree.VariableTree;
@@ -95,6 +98,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 import javax.annotation.Nullable;
 import javax.lang.model.element.AnnotationMirror;
 import javax.lang.model.element.Element;
@@ -157,7 +162,9 @@ public class NullAway extends BugChecker
         BugChecker.WhileLoopTreeMatcher,
         BugChecker.ForLoopTreeMatcher,
         BugChecker.LambdaExpressionTreeMatcher,
-        BugChecker.IdentifierTreeMatcher {
+        BugChecker.IdentifierTreeMatcher,
+        BugChecker.MemberReferenceTreeMatcher,
+        BugChecker.CompoundAssignmentTreeMatcher {
 
   private static final String INITIALIZATION_CHECK_NAME = "NullAway.Init";
 
@@ -170,18 +177,6 @@ public class NullAway extends BugChecker
   private boolean matchWithinClass = true;
 
   private final Config config;
-
-  /**
-   * Fields for which we should report an initialization error when we match them. We report an
-   * error on a field when there are no constructors in the class.
-   */
-  private final Set<Element> fieldsWithInitializationErrors = new LinkedHashSet<>();
-
-  /**
-   * Map from initializer elements (including constructors) to the error message we should when that
-   * constructor is matched.
-   */
-  private final Map<Element, String> initializerErrors = new LinkedHashMap<>();
 
   /**
    * The handler passed to our analysis (usually a {@code CompositeHandler} including handlers for
@@ -212,6 +207,13 @@ public class NullAway extends BugChecker
       new LinkedHashMap<>();
 
   /**
+   * dynamically computer/overriden nullness facts for certain expressions, such as specific method
+   * calls where we can infer a more precise set of facts than those given by the method's
+   * annotations.
+   */
+  private final Map<ExpressionTree, Nullness> computedNullnessMap = new LinkedHashMap<>();
+
+  /**
    * Error Prone requires us to have an empty constructor for each Plugin, in addition to the
    * constructor taking an ErrorProneFlags object. This constructor should not be used anywhere
    * else. Checker objects constructed with this constructor will fail with IllegalStateException if
@@ -233,7 +235,7 @@ public class NullAway extends BugChecker
   private Predicate<MethodInvocationNode> nonAnnotatedMethodCheck() {
     return invocationNode ->
         invocationNode == null
-            || NullabilityUtil.fromUnannotatedPackage(
+            || NullabilityUtil.isUnannotated(
                 ASTHelpers.getSymbol(invocationNode.getTree()), config);
   }
 
@@ -302,12 +304,38 @@ public class NullAway extends BugChecker
     if (!matchWithinClass) {
       return Description.NO_MATCH;
     }
-    final Symbol.MethodSymbol methodSymbol = ASTHelpers.getSymbol(tree);
+    Symbol.MethodSymbol methodSymbol = ASTHelpers.getSymbol(tree);
     if (methodSymbol == null) {
       throw new RuntimeException("not expecting unresolved method here");
     }
     List<? extends ExpressionTree> actualParams = tree.getArguments();
+    if (tree.getClassBody() != null && actualParams.size() > 0) {
+      // passing parameters to constructor of anonymous class
+      // this constructor just invokes the constructor of the superclass, and
+      // in the AST does not have the parameter nullability annotations from the superclass.
+      // so, treat as if the superclass constructor is being invoked directly
+      // see https://github.com/uber/NullAway/issues/102
+      methodSymbol = getSymbolOfSuperConstructor(methodSymbol, state);
+    }
     return handleInvocation(state, methodSymbol, actualParams);
+  }
+
+  private Symbol.MethodSymbol getSymbolOfSuperConstructor(
+      Symbol.MethodSymbol anonClassConstructorSymbol, VisitorState state) {
+    // get the statements in the body of the anonymous class constructor
+    List<? extends StatementTree> statements =
+        getTreesInstance(state).getTree(anonClassConstructorSymbol).getBody().getStatements();
+    // there should be exactly one statement, which is an invocation of the super constructor
+    if (statements.size() == 1) {
+      StatementTree stmt = statements.get(0);
+      if (stmt instanceof ExpressionStatementTree) {
+        ExpressionTree expression = ((ExpressionStatementTree) stmt).getExpression();
+        if (expression instanceof MethodInvocationTree) {
+          return ASTHelpers.getSymbol((MethodInvocationTree) expression);
+        }
+      }
+    }
+    throw new IllegalStateException("unexpected anonymous class constructor body " + statements);
   }
 
   @Override
@@ -339,11 +367,30 @@ public class NullAway extends BugChecker
   }
 
   @Override
+  public Description matchCompoundAssignment(CompoundAssignmentTree tree, VisitorState state) {
+    if (!matchWithinClass) {
+      return Description.NO_MATCH;
+    }
+    Type lhsType = ASTHelpers.getType(tree.getVariable());
+    Type stringType = state.getTypeFromString("java.lang.String");
+    if (lhsType != null && !lhsType.equals(stringType)) {
+      // both LHS and RHS could get unboxed
+      return doUnboxingCheck(state, tree.getVariable(), tree.getExpression());
+    }
+    return Description.NO_MATCH;
+  }
+
+  @Override
   public Description matchArrayAccess(ArrayAccessTree tree, VisitorState state) {
     if (!matchWithinClass) {
       return Description.NO_MATCH;
     }
-    return matchDereference(tree.getExpression(), tree, state);
+    Description description = matchDereference(tree.getExpression(), tree, state);
+    if (!description.equals(Description.NO_MATCH)) {
+      return description;
+    }
+    // also check for unboxing of array index expression
+    return doUnboxingCheck(state, tree.getIndex());
   }
 
   @Override
@@ -380,9 +427,6 @@ public class NullAway extends BugChecker
     // overridden method (if overridden method is in an annotated
     // package)
     Symbol.MethodSymbol methodSymbol = ASTHelpers.getSymbol(tree);
-    if (initializerErrors.containsKey(methodSymbol)) {
-      return reportInitializerError(methodSymbol, tree);
-    }
     handler.onMatchMethod(this, tree, state, methodSymbol);
     boolean isOverriding = ASTHelpers.hasAnnotation(methodSymbol, Override.class, state);
     boolean exhaustiveOverride = config.exhaustiveOverride();
@@ -392,61 +436,97 @@ public class NullAway extends BugChecker
       if (closestOverriddenMethod == null) {
         return Description.NO_MATCH;
       }
-      if (NullabilityUtil.fromUnannotatedPackage(closestOverriddenMethod, config)) {
-        return Description.NO_MATCH;
-      }
-      // if the super method returns nonnull,
-      // overriding method better not return nullable
-      if (!Nullness.hasNullableAnnotation(closestOverriddenMethod)) {
-        if (Nullness.hasNullableAnnotation(methodSymbol)) {
-          String message =
-              "method returns @Nullable, but superclass method "
-                  + ASTHelpers.enclosingClass(closestOverriddenMethod)
-                  + "."
-                  + closestOverriddenMethod.toString()
-                  + " returns @NonNull";
-          return createErrorDescription(MessageTypes.WRONG_OVERRIDE_RETURN, tree, message, tree);
-        }
-      }
-      // if any parameter in the super method is annotated @Nullable,
-      // overriding method cannot assume @Nonnull
-      return checkParamOverriding(tree, tree.getParameters(), closestOverriddenMethod, false);
+      return checkOverriding(closestOverriddenMethod, methodSymbol, null, state);
     }
     return Description.NO_MATCH;
   }
 
+  /**
+   * checks that an overriding method does not override a {@code @Nullable} parameter with a
+   * {@code @NonNull} parameter
+   *
+   * @param overridingParamSymbols parameters of the overriding method
+   * @param overriddenMethod method being overridden
+   * @param lambdaExpressionTree if the overriding method is a lambda, the {@link
+   *     LambdaExpressionTree}; otherwise {@code null}
+   * @param memberReferenceTree if the overriding method is a member reference (which "overrides" a
+   *     functional interface method), the {@link MemberReferenceTree}; otherwise {@code null}
+   * @return
+   */
   private Description checkParamOverriding(
-      Tree tree,
-      List<? extends VariableTree> methodParams,
-      Symbol.MethodSymbol closestOverriddenMethod,
-      boolean isLambda) {
-    com.sun.tools.javac.util.List<VarSymbol> superParamSymbols =
-        closestOverriddenMethod.getParameters();
-    for (int i = 0; i < superParamSymbols.size(); i++) {
-      VarSymbol superParam = superParamSymbols.get(i);
-      if (Nullness.hasNullableAnnotation(superParam)) {
-        VariableTree param = methodParams.get(i);
-        VarSymbol paramSymbol = ASTHelpers.getSymbol(param);
+      List<VarSymbol> overridingParamSymbols,
+      Symbol.MethodSymbol overriddenMethod,
+      @Nullable LambdaExpressionTree lambdaExpressionTree,
+      @Nullable MemberReferenceTree memberReferenceTree,
+      VisitorState state) {
+    com.sun.tools.javac.util.List<VarSymbol> superParamSymbols = overriddenMethod.getParameters();
+    boolean unboundMemberRef =
+        (memberReferenceTree != null)
+            && ((JCTree.JCMemberReference) memberReferenceTree).kind.isUnbound();
+    // if we have an unbound method reference, the first parameter of the overridden method must be
+    // @NonNull, as this parameter will be used as a method receiver inside the generated lambda
+    if (unboundMemberRef) {
+      // there must be at least one parameter; otherwise code wouldn't compile
+      if (Nullness.hasNullableAnnotation(superParamSymbols.get(0))) {
+        String message =
+            "unbound instance method reference cannot be used, as first parameter of "
+                + "functional interface method "
+                + ASTHelpers.enclosingClass(overriddenMethod)
+                + "."
+                + overriddenMethod.toString()
+                + " is @Nullable";
+        return createErrorDescription(
+            MessageTypes.WRONG_OVERRIDE_PARAM, memberReferenceTree, message, memberReferenceTree);
+      }
+    }
+    // for unbound member references, we need to adjust parameter indices by 1 when matching with
+    // overridden method
+    int startParam = unboundMemberRef ? 1 : 0;
+    for (int i = startParam; i < superParamSymbols.size(); i++) {
+      // we need to call paramHasNullableAnnotation here since overriddenMethod may be defined
+      // in a class file
+      if (Nullness.paramHasNullableAnnotation(overriddenMethod, i)) {
+        int methodParamInd = i - startParam;
+        VarSymbol paramSymbol = overridingParamSymbols.get(methodParamInd);
         // in the case where we have a parameter of a lambda expression, we do
         // *not* force the parameter to be annotated with @Nullable; instead we "inherit"
-        // nullability from the corresponding functional interface method
-        if (!Nullness.hasNullableAnnotation(paramSymbol)
-            && !(isLambda && !NullabilityUtil.lambdaParamIsExplicitlyTyped(param))) {
+        // nullability from the corresponding functional interface method.
+        // So, we report an error if the @Nullable annotation is missing *and*
+        // we don't have a lambda with implicitly typed parameters
+        boolean implicitlyTypedLambdaParam =
+            lambdaExpressionTree != null
+                && NullabilityUtil.lambdaParamIsImplicitlyTyped(
+                    lambdaExpressionTree.getParameters().get(methodParamInd));
+        if (!Nullness.hasNullableAnnotation(paramSymbol) && !implicitlyTypedLambdaParam) {
           String message =
               "parameter "
-                  + param.getName()
+                  + paramSymbol.name.toString()
+                  + (memberReferenceTree != null ? " of referenced method" : "")
                   + " is @NonNull, but parameter in "
-                  + (isLambda ? "functional interface " : "superclass ")
+                  + ((lambdaExpressionTree != null || memberReferenceTree != null)
+                      ? "functional interface "
+                      : "superclass ")
                   + "method "
-                  + ASTHelpers.enclosingClass(closestOverriddenMethod)
+                  + ASTHelpers.enclosingClass(overriddenMethod)
                   + "."
-                  + closestOverriddenMethod.toString()
+                  + overriddenMethod.toString()
                   + " is @Nullable";
-          return createErrorDescription(MessageTypes.WRONG_OVERRIDE_PARAM, param, message, param);
+          Tree errorTree;
+          if (memberReferenceTree != null) {
+            errorTree = memberReferenceTree;
+          } else {
+            errorTree = getTreesInstance(state).getTree(paramSymbol);
+          }
+          return createErrorDescription(
+              MessageTypes.WRONG_OVERRIDE_PARAM, errorTree, message, errorTree);
         }
       }
     }
     return Description.NO_MATCH;
+  }
+
+  private static Trees getTreesInstance(VisitorState state) {
+    return Trees.instance(JavacProcessingEnvironment.instance(state.context));
   }
 
   private Description checkReturnExpression(
@@ -459,7 +539,7 @@ public class NullAway extends BugChecker
     if (returnType.toString().equals("java.lang.Void")) {
       return Description.NO_MATCH;
     }
-    if (NullabilityUtil.fromUnannotatedPackage(methodSymbol, config)
+    if (NullabilityUtil.isUnannotated(methodSymbol, config)
         || Nullness.hasNullableAnnotation(methodSymbol)) {
       return Description.NO_MATCH;
     }
@@ -473,19 +553,98 @@ public class NullAway extends BugChecker
 
   @Override
   public Description matchLambdaExpression(LambdaExpressionTree tree, VisitorState state) {
-    Symbol.MethodSymbol methodSymbol =
+    Symbol.MethodSymbol funcInterfaceMethod =
         NullabilityUtil.getFunctionalInterfaceMethod(tree, state.getTypes());
-    handler.onMatchLambdaExpression(this, tree, state, methodSymbol);
-    Description description = checkParamOverriding(tree, tree.getParameters(), methodSymbol, true);
+    handler.onMatchLambdaExpression(this, tree, state, funcInterfaceMethod);
+    if (NullabilityUtil.isUnannotated(funcInterfaceMethod, config)) {
+      return Description.NO_MATCH;
+    }
+    Description description =
+        checkParamOverriding(
+            tree.getParameters().stream().map(ASTHelpers::getSymbol).collect(Collectors.toList()),
+            funcInterfaceMethod,
+            tree,
+            null,
+            state);
     if (description != Description.NO_MATCH) {
       return description;
     }
+    // if the body has a return statement, that gets checked in matchReturn().  We need this code
+    // for lambdas with expression bodies
     if (tree.getBodyKind() == LambdaExpressionTree.BodyKind.EXPRESSION
-        && methodSymbol.getReturnType().getKind() != TypeKind.VOID) {
+        && funcInterfaceMethod.getReturnType().getKind() != TypeKind.VOID) {
       ExpressionTree resExpr = (ExpressionTree) tree.getBody();
-      return checkReturnExpression(tree, resExpr, methodSymbol, state);
+      return checkReturnExpression(tree, resExpr, funcInterfaceMethod, state);
     }
     return Description.NO_MATCH;
+  }
+
+  /**
+   * for method references, we check that the referenced method correctly overrides the
+   * corresponding functional interface method
+   */
+  @Override
+  public Description matchMemberReference(MemberReferenceTree tree, VisitorState state) {
+    Symbol.MethodSymbol referencedMethod = ASTHelpers.getSymbol(tree);
+    Symbol.MethodSymbol funcInterfaceSymbol =
+        NullabilityUtil.getFunctionalInterfaceMethod(tree, state.getTypes());
+    handler.onMatchMethodReference(this, tree, state, referencedMethod);
+    return checkOverriding(funcInterfaceSymbol, referencedMethod, tree, state);
+  }
+
+  /**
+   * check that nullability annotations of an overriding method are consistent with those in the
+   * overridden method (both return and parameters)
+   *
+   * @param overriddenMethod method being overridden
+   * @param overridingMethod overriding method
+   * @param memberReferenceTree if override is via a method reference, the relevant {@link
+   *     MemberReferenceTree}; otherwise {@code null}. If non-null, overridingTree is the AST of the
+   *     referenced method
+   * @param state
+   * @return discovered error, or {@link Description#NO_MATCH} if no error
+   */
+  private Description checkOverriding(
+      Symbol.MethodSymbol overriddenMethod,
+      Symbol.MethodSymbol overridingMethod,
+      @Nullable MemberReferenceTree memberReferenceTree,
+      VisitorState state) {
+    if (NullabilityUtil.isUnannotated(overriddenMethod, config)) {
+      return Description.NO_MATCH;
+    }
+    // if the super method returns nonnull,
+    // overriding method better not return nullable
+    if (!Nullness.hasNullableAnnotation(overriddenMethod)
+        && Nullness.hasNullableAnnotation(overridingMethod)
+        && getComputedNullness(memberReferenceTree).equals(Nullness.NULLABLE)) {
+      String message;
+      if (memberReferenceTree != null) {
+        message =
+            "referenced method returns @Nullable, but functional interface method "
+                + ASTHelpers.enclosingClass(overriddenMethod)
+                + "."
+                + overriddenMethod.toString()
+                + " returns @NonNull";
+
+      } else {
+        message =
+            "method returns @Nullable, but superclass method "
+                + ASTHelpers.enclosingClass(overriddenMethod)
+                + "."
+                + overriddenMethod.toString()
+                + " returns @NonNull";
+      }
+      Tree errorTree =
+          memberReferenceTree != null
+              ? memberReferenceTree
+              : getTreesInstance(state).getTree(overridingMethod);
+      return createErrorDescription(
+          MessageTypes.WRONG_OVERRIDE_RETURN, errorTree, message, errorTree);
+    }
+    // if any parameter in the super method is annotated @Nullable,
+    // overriding method cannot assume @Nonnull
+    return checkParamOverriding(
+        overridingMethod.getParameters(), overriddenMethod, null, memberReferenceTree, state);
   }
 
   @Override
@@ -635,23 +794,42 @@ public class NullAway extends BugChecker
     List<? extends StatementTree> statements = blockTree.getStatements();
     Tree readExprTree = pathToRead.getLeaf();
     int readStartPos = getStartPos((JCTree) readExprTree);
-    Symbol.ClassSymbol classSymbol = enclosingClassSymbol(enclosingBlockPath);
-    // bound loop at size-1 since the final statement cannot appear before the read
-    for (int i = 0; i < statements.size() - 1; i++) {
-      StatementTree curStmt = statements.get(i), nextStmt = statements.get(i + 1);
-      if (getStartPos((JCTree) nextStmt) <= readStartPos) {
+    TreePath classTreePath = enclosingBlockPath;
+    // look for the parent ClassTree node, which represents the enclosing class / enum / interface
+    while (!(classTreePath.getLeaf() instanceof ClassTree)) {
+      classTreePath = classTreePath.getParentPath();
+      if (classTreePath == null) {
+        throw new IllegalStateException(
+            "could not find enclosing class / enum / interface for "
+                + enclosingBlockPath.getLeaf());
+      }
+    }
+    Symbol.ClassSymbol classSymbol = ASTHelpers.getSymbol((ClassTree) classTreePath.getLeaf());
+    for (int i = 0; i < statements.size(); i++) {
+      StatementTree curStmt = statements.get(i);
+      if (getStartPos((JCTree) curStmt) <= readStartPos) {
         Element privMethodElem = getInvokeOfSafeInitMethod(curStmt, classSymbol, state);
         if (privMethodElem != null) {
           safeInitMethods.add(privMethodElem);
         }
+        // Hack: Handling try{...}finally{...} statement, see getSafeInitMethods
+        if (curStmt.getKind().equals(Tree.Kind.TRY)) {
+          TryTree tryTree = (TryTree) curStmt;
+          if (tryTree.getCatches().size() == 0) {
+            result.addAll(
+                safeInitByCalleeBefore(
+                    pathToRead, state, new TreePath(enclosingBlockPath, tryTree.getBlock())));
+            result.addAll(
+                safeInitByCalleeBefore(
+                    pathToRead,
+                    state,
+                    new TreePath(enclosingBlockPath, tryTree.getFinallyBlock())));
+          }
+        }
       }
     }
     addGuaranteedNonNullFromInvokes(
-        state,
-        Trees.instance(JavacProcessingEnvironment.instance(state.context)),
-        safeInitMethods,
-        getNullnessAnalysis(state),
-        result);
+        state, getTreesInstance(state), safeInitMethods, getNullnessAnalysis(state), result);
     return result;
   }
 
@@ -782,7 +960,9 @@ public class NullAway extends BugChecker
     SuppressWarnings annotation = symbol.getAnnotation(SuppressWarnings.class);
     if (annotation != null) {
       for (String s : annotation.value()) {
-        if (s.equals(INITIALIZATION_CHECK_NAME)) {
+        // we need to check for standard suppressions here also since we may report initialization
+        // errors outside the normal ErrorProne match* methods
+        if (s.equals(INITIALIZATION_CHECK_NAME) || allNames().stream().anyMatch(s::equals)) {
           return true;
         }
       }
@@ -801,22 +981,6 @@ public class NullAway extends BugChecker
     }
     if (!symbol.getKind().equals(ElementKind.FIELD)) {
       return Description.NO_MATCH;
-    }
-    if (fieldsWithInitializationErrors.contains(symbol)) {
-      // be careful to delete entry to avoid leaks
-      fieldsWithInitializationErrors.remove(symbol);
-      if (symbolHasSuppressInitalizationWarningsAnnotation(symbol)) {
-        return Description.NO_MATCH;
-      }
-      if (symbol.isStatic()) {
-        return createErrorDescription(
-            MessageTypes.FIELD_NO_INIT,
-            tree,
-            "@NonNull static field " + symbol + " not initialized",
-            tree);
-      }
-      return createErrorDescription(
-          MessageTypes.FIELD_NO_INIT, tree, "@NonNull field " + symbol + " not initialized", tree);
     }
     ExpressionTree initializer = tree.getInitializer();
     if (initializer != null) {
@@ -855,6 +1019,7 @@ public class NullAway extends BugChecker
       initTree2PrevFieldInit.clear();
       class2Entities.clear();
       class2ConstructorUninit.clear();
+      computedNullnessMap.clear();
     }
     if (matchWithinClass) {
       checkFieldInitialization(tree, state);
@@ -947,7 +1112,7 @@ public class NullAway extends BugChecker
       Symbol.MethodSymbol methodSymbol,
       List<? extends ExpressionTree> actualParams) {
     ImmutableSet<Integer> nonNullPositions = null;
-    if (NullabilityUtil.fromUnannotatedPackage(methodSymbol, config)) {
+    if (NullabilityUtil.isUnannotated(methodSymbol, config)) {
       nonNullPositions =
           handler.onUnannotatedInvocationGetNonNullPositions(
               this, state, methodSymbol, actualParams, ImmutableSet.of());
@@ -971,8 +1136,9 @@ public class NullAway extends BugChecker
             continue;
           }
         }
-        boolean nullable = Nullness.hasNullableAnnotation(param);
-        if (!nullable) {
+        // we need to call paramHasNullableAnnotation here since the invoked method may be defined
+        // in a class file
+        if (!Nullness.paramHasNullableAnnotation(methodSymbol, i)) {
           builder.add(i);
         }
       }
@@ -1032,8 +1198,11 @@ public class NullAway extends BugChecker
         // report it on the initializer
         errorFieldsForInitializer.put(singleInitializerMethod, uninitField);
       } else if (constructorInitInfo == null) {
-        // report it on the field
-        fieldsWithInitializationErrors.add(uninitField);
+        // report it on the field, except in the case where the class is externalInit and
+        // we have no initializer methods
+        if (!(isExternalInit(classSymbol) && entities.instanceInitializerMethods().isEmpty())) {
+          reportInitErrorOnField(uninitField, state);
+        }
       } else {
         // report it on each constructor that does not initialize it
         for (MethodTree methodTree : constructorInitInfo.keySet()) {
@@ -1045,9 +1214,10 @@ public class NullAway extends BugChecker
       }
     }
     for (Element constructorElement : errorFieldsForInitializer.keySet()) {
-      initializerErrors.put(
-          constructorElement,
-          errMsgForInitializer(errorFieldsForInitializer.get(constructorElement)));
+      reportInitializerError(
+          (Symbol.MethodSymbol) constructorElement,
+          errMsgForInitializer(errorFieldsForInitializer.get(constructorElement)),
+          state);
     }
     // For static fields
     Set<Symbol> notInitializedStaticFields = notInitializedStatic(entities, state);
@@ -1055,7 +1225,7 @@ public class NullAway extends BugChecker
       // Always report it on the field for static fields (can't do @SuppressWarnings on a static
       // initialization block
       // anyways).
-      fieldsWithInitializationErrors.add(uninitSField);
+      reportInitErrorOnField(uninitSField, state);
     }
   }
 
@@ -1068,7 +1238,7 @@ public class NullAway extends BugChecker
    */
   private Set<Symbol> notAssignedInAnyInitializer(
       FieldInitEntities entities, Set<Symbol> notInitializedInConstructors, VisitorState state) {
-    Trees trees = Trees.instance(JavacProcessingEnvironment.instance(state.context));
+    Trees trees = getTreesInstance(state);
     Symbol.ClassSymbol classSymbol = entities.classSymbol();
     Set<Element> initInSomeInitializer = new LinkedHashSet<>();
     for (MethodTree initMethodTree : entities.instanceInitializerMethods()) {
@@ -1126,9 +1296,14 @@ public class NullAway extends BugChecker
       FieldInitEntities entities, VisitorState state) {
     SetMultimap<MethodTree, Symbol> result = LinkedHashMultimap.create();
     Set<Symbol> nonnullInstanceFields = entities.nonnullInstanceFields();
-    Trees trees = Trees.instance(JavacProcessingEnvironment.instance(state.context));
+    Trees trees = getTreesInstance(state);
+    boolean isExternalInit = isExternalInit(entities.classSymbol());
     for (MethodTree constructor : entities.constructors()) {
       if (constructorInvokesAnother(constructor, state)) {
+        continue;
+      }
+      if (constructor.getParameters().size() == 0 && isExternalInit) {
+        // external framework initializes fields in this case
         continue;
       }
       Set<Element> guaranteedNonNull =
@@ -1140,6 +1315,12 @@ public class NullAway extends BugChecker
       }
     }
     return result;
+  }
+
+  private boolean isExternalInit(Symbol.ClassSymbol classSymbol) {
+    return StreamSupport.stream(NullabilityUtil.getAllAnnotations(classSymbol).spliterator(), false)
+        .map((anno) -> anno.getAnnotationType().toString())
+        .anyMatch(config::isExternalInitClassAnnotation);
   }
 
   private Set<Element> guaranteedNonNullForConstructor(
@@ -1222,6 +1403,22 @@ public class NullAway extends BugChecker
       Element privMethodElem = getInvokeOfSafeInitMethod(stmt, classSymbol, state);
       if (privMethodElem != null) {
         result.add(privMethodElem);
+      }
+      // Hack: If we see a try{...}finally{...} statement, without a catch, we consider the methods
+      // inside both blocks
+      // as "top level" for the purposes of finding initialization methods. Any exception happening
+      // there is also an
+      // exception of the full method.
+      if (stmt.getKind().equals(Tree.Kind.TRY)) {
+        TryTree tryTree = (TryTree) stmt;
+        if (tryTree.getCatches().size() == 0) {
+          if (tryTree.getBlock() != null) {
+            result.addAll(getSafeInitMethods(tryTree.getBlock(), classSymbol, state));
+          }
+          if (tryTree.getFinallyBlock() != null) {
+            result.addAll(getSafeInitMethods(tryTree.getFinallyBlock(), classSymbol, state));
+          }
+        }
       }
     }
     return result;
@@ -1375,13 +1572,9 @@ public class NullAway extends BugChecker
   }
 
   private boolean skipDueToFieldAnnotation(Symbol fieldSymbol) {
-    for (AnnotationMirror anno : NullabilityUtil.getAllAnnotations(fieldSymbol)) {
-      String annoTypeStr = anno.getAnnotationType().toString();
-      if (config.isExcludedFieldAnnotation(annoTypeStr)) {
-        return true;
-      }
-    }
-    return false;
+    return NullabilityUtil.getAllAnnotations(fieldSymbol)
+        .map(anno -> anno.getAnnotationType().toString())
+        .anyMatch(config::isExcludedFieldAnnotation);
   }
 
   private boolean isExcludedClass(Symbol.ClassSymbol classSymbol, VisitorState state) {
@@ -1389,7 +1582,7 @@ public class NullAway extends BugChecker
     if (config.isExcludedClass(className)) {
       return true;
     }
-    if (!config.fromAnnotatedPackage(className)) {
+    if (!config.fromAnnotatedPackage(classSymbol)) {
       return true;
     }
     // check annotations
@@ -1427,6 +1620,18 @@ public class NullAway extends BugChecker
         // Lambdas may return null, but the lambda literal itself should not be null
       case MEMBER_REFERENCE:
         // These cannot be null; the compiler would catch it
+      case MULTIPLY_ASSIGNMENT:
+      case DIVIDE_ASSIGNMENT:
+      case REMAINDER_ASSIGNMENT:
+      case PLUS_ASSIGNMENT:
+      case MINUS_ASSIGNMENT:
+      case LEFT_SHIFT_ASSIGNMENT:
+      case RIGHT_SHIFT_ASSIGNMENT:
+      case UNSIGNED_RIGHT_SHIFT_ASSIGNMENT:
+      case AND_ASSIGNMENT:
+      case XOR_ASSIGNMENT:
+      case OR_ASSIGNMENT:
+        // result of compound assignment cannot be null
       case PLUS:
         // rest are for auto-boxing
       case MINUS:
@@ -1482,7 +1687,7 @@ public class NullAway extends BugChecker
 
   private boolean mayBeNullMethodCall(
       VisitorState state, ExpressionTree expr, Symbol.MethodSymbol exprSymbol) {
-    if (NullabilityUtil.fromUnannotatedPackage(exprSymbol, config)) {
+    if (NullabilityUtil.isUnannotated(exprSymbol, config)) {
       return false;
     }
     if (!Nullness.hasNullableAnnotation(exprSymbol)) {
@@ -1578,7 +1783,7 @@ public class NullAway extends BugChecker
    * @param suggestTree the location at which a fix suggestion should be made
    * @return the error description
    */
-  private Description createErrorDescription(
+  public Description createErrorDescription(
       MessageTypes errorType, Tree errorLocTree, String message, @Nullable Tree suggestTree) {
     Description.Builder builder = buildDescription(errorLocTree).setMessage(message);
     if (config.suggestSuppressions() && suggestTree != null) {
@@ -1594,14 +1799,16 @@ public class NullAway extends BugChecker
           }
           break;
         case WRONG_OVERRIDE_RETURN:
-          builder = changeReturnNullabilityFix(suggestTree, builder);
+          builder = addSuppressWarningsFix(suggestTree, builder, canonicalName());
           break;
         case WRONG_OVERRIDE_PARAM:
-          builder = changeParamNullabilityFix(suggestTree, builder);
+          builder = addSuppressWarningsFix(suggestTree, builder, canonicalName());
           break;
         case METHOD_NO_INIT:
         case FIELD_NO_INIT:
           builder = addSuppressWarningsFix(suggestTree, builder, INITIALIZATION_CHECK_NAME);
+          break;
+        case ANNOTATION_VALUE_INVALID:
           break;
         default:
           builder = addSuppressWarningsFix(suggestTree, builder, canonicalName());
@@ -1681,6 +1888,7 @@ public class NullAway extends BugChecker
     return builder.addFix(fix);
   }
 
+  @SuppressWarnings("unused")
   private Description.Builder changeReturnNullabilityFix(
       Tree suggestTree, Description.Builder builder) {
     if (suggestTree.getKind() != Tree.Kind.METHOD) {
@@ -1699,6 +1907,7 @@ public class NullAway extends BugChecker
     return builder.addFix(fixBuilder.build());
   }
 
+  @SuppressWarnings("unused")
   private Description.Builder changeParamNullabilityFix(
       Tree suggestTree, Description.Builder builder) {
     return builder.addFix(SuggestedFix.prefixWith(suggestTree, "@Nullable "));
@@ -1828,15 +2037,14 @@ public class NullAway extends BugChecker
     return null;
   }
 
-  private Description reportInitializerError(
-      Symbol.MethodSymbol methodSymbol, MethodTree methodTree) {
-    String message = initializerErrors.get(methodSymbol);
-    // be careful to delete the entry in the map to avoid a leak
-    initializerErrors.remove(methodSymbol);
+  private void reportInitializerError(
+      Symbol.MethodSymbol methodSymbol, String message, VisitorState state) {
     if (symbolHasSuppressInitalizationWarningsAnnotation(methodSymbol)) {
-      return Description.NO_MATCH;
+      return;
     }
-    return createErrorDescription(MessageTypes.METHOD_NO_INIT, methodTree, message, methodTree);
+    Tree methodTree = getTreesInstance(state).getTree(methodSymbol);
+    state.reportMatch(
+        createErrorDescription(MessageTypes.METHOD_NO_INIT, methodTree, message, methodTree));
   }
 
   private String errMsgForInitializer(Set<Element> uninitFields) {
@@ -1850,7 +2058,64 @@ public class NullAway extends BugChecker
     return message;
   }
 
-  public static enum MessageTypes {
+  private void reportInitErrorOnField(Symbol symbol, VisitorState state) {
+    if (symbolHasSuppressInitalizationWarningsAnnotation(symbol)) {
+      return;
+    }
+    Tree tree = getTreesInstance(state).getTree(symbol);
+    if (symbol.isStatic()) {
+      state.reportMatch(
+          createErrorDescription(
+              MessageTypes.FIELD_NO_INIT,
+              tree,
+              "@NonNull static field " + symbol + " not initialized",
+              tree));
+    } else {
+      state.reportMatch(
+          createErrorDescription(
+              MessageTypes.FIELD_NO_INIT,
+              tree,
+              "@NonNull field " + symbol + " not initialized",
+              tree));
+    }
+  }
+
+  /**
+   * Returns the computed nullness information from an expression. If none is available, it returns
+   * Nullable.
+   *
+   * <p>Computed information can be added by handlers or by the core, and should supersede that
+   * comming from annotations.
+   *
+   * <p>The default value of an expression without additional computed nullness information is
+   * always Nullable, since this method should only be called when the fact that the expression is
+   * NonNull is not clear from looking at annotations.
+   *
+   * @param e an expression
+   * @return computed nullness for e, if any, else Nullable
+   */
+  public Nullness getComputedNullness(ExpressionTree e) {
+    if (computedNullnessMap.containsKey(e)) {
+      return computedNullnessMap.get(e);
+    } else {
+      return Nullness.NULLABLE;
+    }
+  }
+
+  /**
+   * Add computed nullness informat to an expression.
+   *
+   * <p>Used by handlers to communicate that an expression should has a more precise nullness than
+   * what is known from source annotations.
+   *
+   * @param e
+   * @param nullness
+   */
+  public void setComputedNullness(ExpressionTree e, Nullness nullness) {
+    computedNullnessMap.put(e, nullness);
+  }
+
+  public enum MessageTypes {
     DEREFERENCE_NULLABLE,
     RETURN_NULLABLE,
     PASS_NULLABLE,
@@ -1860,7 +2125,8 @@ public class NullAway extends BugChecker
     METHOD_NO_INIT,
     FIELD_NO_INIT,
     UNBOX_NULLABLE,
-    NONNULL_FIELD_READ_BEFORE_INIT;
+    NONNULL_FIELD_READ_BEFORE_INIT,
+    ANNOTATION_VALUE_INVALID;
   }
 
   @AutoValue

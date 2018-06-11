@@ -52,15 +52,14 @@ public class NullAwayTest {
                 + "com.uber.nullaway.testdata.CheckFieldInitNegativeCases"
                 + ".SuperInterface.doInit2",
             "-XepOpt:NullAway:AnnotatedPackages=com.uber,com.ubercab,io.reactivex",
-            "-XepOpt:NullAway:UnannotatedSubPackages=" + "com.uber.nullaway.testdata.unannotated",
+            // We give the following in Regexp format to test that support
+            "-XepOpt:NullAway:UnannotatedSubPackages=com.uber.nullaway.[a-zA-Z0-9.]+.unannotated",
             "-XepOpt:NullAway:ExcludedClasses="
                 + "com.uber.nullaway.testdata.Shape_Stuff,"
                 + "com.uber.nullaway.testdata.excluded",
-            "-XepOpt:NullAway:ExcludedClassAnnotations="
-                + "com.uber.nullaway.testdata"
-                + ".TestAnnot",
-            "-XepOpt:NullAway:ExcludedFieldAnnotations=javax.inject.Inject",
-            "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull"));
+            "-XepOpt:NullAway:ExcludedClassAnnotations=com.uber.nullaway.testdata.TestAnnot",
+            "-XepOpt:NullAway:CastToNonNullMethod=com.uber.nullaway.testdata.Util.castToNonNull",
+            "-XepOpt:NullAway:ExternalInitAnnotations=com.uber.ExternalInit"));
   }
 
   @Test
@@ -97,7 +96,11 @@ public class NullAwayTest {
 
   @Test
   public void coreNullabilityNativeModels() {
-    compilationHelper.addSourceFile("NullAwayNativeModels.java").doTest();
+    compilationHelper
+        .addSourceFile("NullAwayNativeModels.java")
+        .addSourceFile("androidstubs/WebView.java")
+        .addSourceFile("androidstubs/TextUtils.java")
+        .doTest();
   }
 
   @Test
@@ -153,6 +156,582 @@ public class NullAwayTest {
     compilationHelper
         .addSourceFile("ReadBeforeInitNegativeCases.java")
         .addSourceFile("Util.java")
+        .doTest();
+  }
+
+  @Test
+  public void tryFinallySupport() {
+    compilationHelper.addSourceFile("NullAwayTryFinallyCases.java").doTest();
+  }
+
+  @Test
+  public void externalInitSupport() {
+    compilationHelper
+        .addSourceLines(
+            "ExternalInit.java",
+            "package com.uber;",
+            "@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)",
+            "public @interface ExternalInit {}")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "@ExternalInit",
+            "class Test {",
+            "  Object f;",
+            // no error here due to external init
+            "  public Test() {}",
+            "  // BUG: Diagnostic contains: initializer method does not guarantee @NonNull field",
+            "  public Test(int x) {}",
+            "}")
+        .addSourceLines(
+            "Test2.java",
+            "package com.uber;",
+            "@ExternalInit",
+            "class Test2 {",
+            // no error here due to external init
+            "  Object f;",
+            "}")
+        .addSourceLines(
+            "Test3.java",
+            "package com.uber;",
+            "@ExternalInit",
+            "class Test3 {",
+            "  Object f;",
+            "  // BUG: Diagnostic contains: initializer method does not guarantee @NonNull field",
+            "  public Test3(int x) {}",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void generatedAsUnannotated() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:TreatGeneratedAsUnannotated=true"))
+        .addSourceLines(
+            "Generated.java",
+            "package com.uber;",
+            "@javax.annotation.Generated(\"foo\")",
+            "public class Generated { public void takeObj(Object o) {} }")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "class Test {",
+            "  void foo() { (new Generated()).takeObj(null); }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void basicContractAnnotation() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber"))
+        .addSourceLines(
+            "NullnessChecker.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "import org.jetbrains.annotations.Contract;",
+            "public class NullnessChecker {",
+            "  @Contract(\"_, null -> true\")",
+            "  static boolean isNull(boolean flag, @Nullable Object o) { return o == null; }",
+            "  @Contract(\"null -> false\")",
+            "  static boolean isNonNull(@Nullable Object o) { return o != null; }",
+            "  @Contract(\"null -> fail\")",
+            "  static void assertNonNull(@Nullable Object o) { if (o != null) throw new Error(); }",
+            "}")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "class Test {",
+            "  String test1(@Nullable Object o) {",
+            "    return NullnessChecker.isNonNull(o) ? o.toString() : \"null\";",
+            "  }",
+            "  String test2(@Nullable Object o) {",
+            "    return NullnessChecker.isNull(false, o) ? \"null\" : o.toString();",
+            "  }",
+            "  String test3(@Nullable Object o) {",
+            "    NullnessChecker.assertNonNull(o);",
+            "    return o.toString();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void impliesNonNullContractAnnotation() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber"))
+        .addSourceLines(
+            "NullnessChecker.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "import org.jetbrains.annotations.Contract;",
+            "public class NullnessChecker {",
+            "  @Contract(\"!null -> !null\")",
+            "  static @Nullable Object noOp(@Nullable Object o) { return o; }",
+            "}")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "class Test {",
+            "  String test1(@Nullable Object o1) {",
+            "    // BUG: Diagnostic contains: dereferenced expression",
+            "    return NullnessChecker.noOp(o1).toString();",
+            "  }",
+            "  String test2(Object o2) {",
+            "    return NullnessChecker.noOp(o2).toString();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void malformedContractAnnotations() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber"))
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "import org.jetbrains.annotations.Contract;",
+            "class Test {",
+            "  @Contract(\"!null -> -> !null\")",
+            "  static @Nullable Object foo(@Nullable Object o) { return o; }",
+            "  @Contract(\"!null -> !null\")",
+            "  static @Nullable Object bar(@Nullable Object o, String s) { return o; }",
+            "  @Contract(\"jabberwocky -> !null\")",
+            "  static @Nullable Object baz(@Nullable Object o) { return o; }",
+            // We don't care as long as nobody calls the method:
+            "  @Contract(\"!null -> -> !null\")",
+            "  static @Nullable Object dontcare(@Nullable Object o) { return o; }",
+            "  static Object test1() {",
+            "    // BUG: Diagnostic contains: Invalid @Contract annotation",
+            "    return foo(null);",
+            "  }",
+            "  static Object test2() {",
+            "    // BUG: Diagnostic contains: Invalid @Contract annotation",
+            "    return bar(null, \"\");",
+            "  }",
+            "  static Object test3() {",
+            "    // BUG: Diagnostic contains: Invalid @Contract annotation",
+            "    return baz(null);",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void contractNonVarArg() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber"))
+        .addSourceLines(
+            "NullnessChecker.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "import org.jetbrains.annotations.Contract;",
+            "public class NullnessChecker {",
+            "  @Contract(\"null -> fail\")",
+            "  static void assertNonNull(@Nullable Object o) { if (o != null) throw new Error(); }",
+            "}")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "class Test {",
+            "  void test(java.util.function.Function<Object, Object> fun) {",
+            "    NullnessChecker.assertNonNull(fun.apply(new Object()));",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void testEnumInit() {
+    compilationHelper
+        .addSourceLines(
+            "SomeEnum.java",
+            "package com.uber;",
+            "import java.util.Random;",
+            "enum SomeEnum {",
+            "  FOO, BAR;",
+            "  final Object o;",
+            "  final Object p;",
+            "  private SomeEnum() {",
+            "    this.o = new Object();",
+            "    this.p = new Object();",
+            "    this.o.equals(this.p);",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void testGenericAnonymousInner() {
+    compilationHelper
+        .addSourceLines(
+            "GenericSuper.java",
+            "package com.uber;",
+            "class GenericSuper<T> {",
+            "  T x;",
+            "  GenericSuper(T y) {",
+            "    this.x = y;",
+            "  }",
+            "}")
+        .addSourceLines(
+            "AnonSub.java",
+            "package com.uber;",
+            "import java.util.List;",
+            "import javax.annotation.Nullable;",
+            "class AnonSub {",
+            "  static GenericSuper<List<String>> makeSuper(List<String> list) {",
+            "    return new GenericSuper<List<String>>(list) {};",
+            "  }",
+            "  static GenericSuper<List<String>> makeSuperBad(@Nullable List<String> list) {",
+            "    // BUG: Diagnostic contains: passing @Nullable parameter 'list' where @NonNull",
+            "    return new GenericSuper<List<String>>(list) {};",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void testThriftIsSet() {
+    compilationHelper
+        .addSourceLines("TBase.java", "package org.apache.thrift;", "public interface TBase {}")
+        .addSourceLines(
+            "Generated.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "public class Generated implements org.apache.thrift.TBase {",
+            "  public @Nullable Object id;",
+            "  @Nullable public Object getId() { return this.id; }",
+            "  public boolean isSetId() { return this.id != null; }",
+            "}")
+        .addSourceLines(
+            "Client.java",
+            "package com.uber;",
+            "public class Client {",
+            "  public void testNeg(Generated g) {",
+            "    if (g.isSetId()) {",
+            "      g.getId().toString();",
+            "      g.id.hashCode();",
+            "    }",
+            "  }",
+            "  public void testPos(Generated g) {",
+            "    if (!g.isSetId()) {",
+            "      // BUG: Diagnostic contains: dereferenced expression g.getId() is @Nullable",
+            "      g.getId().hashCode();",
+            "    } else {",
+            "      g.id.toString();",
+            "    }",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void testThriftIsSetWithGenerics() {
+    compilationHelper
+        .addSourceLines(
+            "TBase.java", "package org.apache.thrift;", "public interface TBase<T, F> {}")
+        .addSourceLines(
+            "Generated.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "public class Generated implements org.apache.thrift.TBase<String, Integer> {",
+            "  public @Nullable Object id;",
+            "  @Nullable public Object getId() { return this.id; }",
+            "  public boolean isSetId() { return this.id != null; }",
+            "}")
+        .addSourceLines(
+            "Client.java",
+            "package com.uber;",
+            "public class Client {",
+            "  public void testNeg(Generated g) {",
+            "    if (!g.isSetId()) {",
+            "      return;",
+            "    }",
+            "    Object x = g.getId();",
+            "    if (x.toString() == null) return;",
+            "    g.getId().toString();",
+            "    g.id.hashCode();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void testThriftIsSetWithArg() {
+    compilationHelper
+        .addSourceLines(
+            "TBase.java",
+            "package org.apache.thrift;",
+            "public interface TBase {",
+            "  boolean isSet(String fieldName);",
+            "}")
+        .addSourceLines(
+            "Client.java",
+            "package com.uber;",
+            "public class Client {",
+            "  public void testNeg(org.apache.thrift.TBase tBase) {",
+            "    if (tBase.isSet(\"Hello\")) {",
+            "      System.out.println(\"set\");",
+            "    }",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  /** we do not have proper support for Thrift unions yet; just checks that we don't crash */
+  @Test
+  public void testThriftUnion() {
+    compilationHelper
+        .addSourceLines(
+            "TBase.java", "package org.apache.thrift;", "public interface TBase<T, F> {}")
+        .addSourceLines(
+            "TUnion.java",
+            "package org.apache.thrift;",
+            "public abstract class TUnion<T, F> implements TBase<T, F> {",
+            "  protected Object value_;",
+            "  public Object getFieldValue() {",
+            "    return this.value_;",
+            "  }",
+            "}")
+        .addSourceLines(
+            "Generated.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "public class Generated extends org.apache.thrift.TUnion<String, Integer> {",
+            "  public Object getId() { return getFieldValue(); }",
+            "  public boolean isSetId() { return true; }",
+            "}")
+        .addSourceLines(
+            "Client.java",
+            "package com.uber;",
+            "public class Client {",
+            "  public void testNeg(Generated g) {",
+            "    if (!g.isSetId()) {",
+            "      return;",
+            "    }",
+            "    Object x = g.getId();",
+            "    if (x.toString() == null) return;",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void erasedIterator() {
+    // just checking for crash
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import java.util.*;",
+            "class Test {",
+            "  static class Foo implements Iterable {",
+            "    public Iterator iterator() {",
+            "      return new Iterator() {",
+            "        @Override",
+            "        public boolean hasNext() {",
+            "          return false;",
+            "        }",
+            "        @Override",
+            "        public Iterator next() {",
+            "          throw new NoSuchElementException();",
+            "        }",
+            "      };",
+            "    }",
+            "  }",
+            "  static void testErasedIterator(Foo foo) {",
+            "    for (Object x : foo) {",
+            "      x.hashCode();",
+            "    }",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void compoundAssignment() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "class Test {",
+            "  static void assignments() {",
+            "    String x = null; x += \"hello\";",
+            "    // BUG: Diagnostic contains: unboxing of a @Nullable value",
+            "    Integer y = null; y += 3;",
+            "    // BUG: Diagnostic contains: unboxing of a @Nullable value",
+            "    boolean b = false; Boolean c = null; b |= c;",
+            "  }",
+            "  static Integer returnCompound() {",
+            "    Integer z = 7;",
+            "    return (z += 10);",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void arrayIndexUnbox() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "class Test {",
+            "  static void indexUnbox() {",
+            "    Integer x = null; int[] fizz = { 0, 1 };",
+            "    // BUG: Diagnostic contains: unboxing of a @Nullable value",
+            "    int y = fizz[x];",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void unannotatedClass() {
+    compilationHelper
+        .setArgs(
+            Arrays.asList(
+                "-d",
+                temporaryFolder.getRoot().getAbsolutePath(),
+                "-XepOpt:NullAway:AnnotatedPackages=com.uber",
+                "-XepOpt:NullAway:UnannotatedClasses=com.uber.UnAnnot"))
+        .addSourceLines(
+            "UnAnnot.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "public class UnAnnot {",
+            "  @Nullable static Object retNull() { return null; }",
+            "}")
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import javax.annotation.Nullable;",
+            "class Test {",
+            "  @Nullable static Object nullRetSameClass() { return null; }",
+            "  void test() {",
+            "    UnAnnot.retNull().toString();",
+            // make sure other classes in the package still get analyzed
+            "    Object x = nullRetSameClass();",
+            "    // BUG: Diagnostic contains: dereferenced expression x is @Nullable",
+            "    x.hashCode();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void cfNullableArrayField() {
+    compilationHelper
+        .addSourceLines(
+            "CFNullable.java",
+            "package com.uber;",
+            "import org.checkerframework.checker.nullness.qual.Nullable;",
+            "import java.util.List;",
+            "abstract class CFNullable<E> {",
+            "  List<E> @Nullable [] table;",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void typeUseJarReturn() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import com.uber.lib.*;",
+            "class Test {",
+            "  void foo(CFNullableStuff.NullableReturn r) {",
+            "    // BUG: Diagnostic contains: dereferenced expression",
+            "    r.get().toString();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void typeUseJarParam() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import com.uber.lib.*;",
+            "class Test {",
+            "  void foo(CFNullableStuff.NullableParam p) {",
+            "    p.doSomething(null);",
+            "    // BUG: Diagnostic contains: passing @Nullable parameter",
+            "    p.doSomething2(null, new Object());",
+            "    p.doSomething2(new Object(), null);",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void typeUseJarField() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import com.uber.lib.*;",
+            "class Test {",
+            "  void foo(CFNullableStuff c) {",
+            "    // BUG: Diagnostic contains: dereferenced expression c.f",
+            "    c.f.toString();",
+            "  }",
+            "}")
+        .doTest();
+  }
+
+  @Test
+  public void typeUseJarOverride() {
+    compilationHelper
+        .addSourceLines(
+            "Test.java",
+            "package com.uber;",
+            "import com.uber.lib.*;",
+            "import org.checkerframework.checker.nullness.qual.Nullable;",
+            "class Test {",
+            "  class Test1 implements CFNullableStuff.NullableReturn {",
+            "    public @Nullable Object get() { return null; }",
+            "  }",
+            "  class Test2 implements CFNullableStuff.NullableParam {",
+            "    // BUG: Diagnostic contains: parameter o is @NonNull",
+            "    public void doSomething(Object o) {}",
+            "    // BUG: Diagnostic contains: parameter p is @NonNull",
+            "    public void doSomething2(Object o, Object p) {}",
+            "  }",
+            "  class Test3 implements CFNullableStuff.NullableParam {",
+            "    public void doSomething(@Nullable Object o) {}",
+            "    public void doSomething2(Object o, @Nullable Object p) {}",
+            "  }",
+            "}")
         .doTest();
   }
 }

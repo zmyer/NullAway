@@ -106,8 +106,8 @@ public class AccessPath {
    * @return access path for the method call, or <code>null</code> if it cannot be represented
    */
   @Nullable
-  static AccessPath fromMethodCall(MethodInvocationNode node, Types types) {
-    if (isMapGet(ASTHelpers.getSymbol(node.getTree()), types)) {
+  static AccessPath fromMethodCall(MethodInvocationNode node, @Nullable Types types) {
+    if (types != null && isMapGet(ASTHelpers.getSymbol(node.getTree()), types)) {
       return fromMapGetCall(node);
     }
     return fromVanillaMethodCall(node);
@@ -118,6 +118,22 @@ public class AccessPath {
     List<Element> elements = new ArrayList<>();
     Root root = populateElementsRec(node, elements);
     return (root != null) ? new AccessPath(root, elements) : null;
+  }
+
+  /**
+   * @param base the base expression for the access path
+   * @param element the final element of the access path (a field or method)
+   * @return the {@link AccessPath} {@code base.element}
+   */
+  @Nullable
+  public static AccessPath fromBaseAndElement(Node base, Element element) {
+    List<Element> elements = new ArrayList<>();
+    Root root = populateElementsRec(base, elements);
+    if (root == null) {
+      return null;
+    }
+    elements.add(element);
+    return new AccessPath(root, elements);
   }
 
   /**
@@ -139,7 +155,7 @@ public class AccessPath {
   @Nullable
   private static AccessPath fromMapGetCall(MethodInvocationNode node) {
     Node argument = node.getArgument(0);
-    AccessPath argAccessPath = getAccessPathForNode(argument);
+    AccessPath argAccessPath = getAccessPathForNodeNoMapGet(argument);
     if (argAccessPath == null) {
       return null;
     }
@@ -153,15 +169,34 @@ public class AccessPath {
     return new AccessPath(root, elements, argAccessPath);
   }
 
+  /**
+   * Gets corresponding AccessPath for node, if it exists. Does <emph>not</emph> handle calls to
+   * <code>Map.get()</code>
+   *
+   * @param node AST node
+   * @return corresponding AccessPath if it exists; <code>null</code> otherwise
+   */
   @Nullable
-  public static AccessPath getAccessPathForNode(Node node) {
+  public static AccessPath getAccessPathForNodeNoMapGet(Node node) {
+    return getAccessPathForNodeWithMapGet(node, null);
+  }
+
+  /**
+   * Gets corresponding AccessPath for node, if it exists. Handles calls to <code>Map.get()
+   * </code>
+   *
+   * @param node AST node
+   * @param types javac {@link Types}
+   * @return corresponding AccessPath if it exists; <code>null</code> otherwise
+   */
+  @Nullable
+  public static AccessPath getAccessPathForNodeWithMapGet(Node node, @Nullable Types types) {
     if (node instanceof LocalVariableNode) {
       return fromLocal((LocalVariableNode) node);
     } else if (node instanceof FieldAccessNode) {
       return fromFieldAccess((FieldAccessNode) node);
     } else if (node instanceof MethodInvocationNode) {
-      // let's not handle nested get() calls for now
-      return fromVanillaMethodCall((MethodInvocationNode) node);
+      return fromMethodCall((MethodInvocationNode) node, types);
     } else {
       return null;
     }

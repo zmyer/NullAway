@@ -27,6 +27,7 @@ import com.google.errorprone.VisitorState;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.ReturnTree;
@@ -86,6 +87,15 @@ abstract class BaseNoOpHandler implements Handler {
   }
 
   @Override
+  public void onMatchMethodReference(
+      NullAway analysis,
+      MemberReferenceTree tree,
+      VisitorState state,
+      Symbol.MethodSymbol methodSymbol) {
+    // NoOp
+  }
+
+  @Override
   public void onMatchReturn(NullAway analysis, ReturnTree tree, VisitorState state) {
     // NoOp
   }
@@ -116,14 +126,15 @@ abstract class BaseNoOpHandler implements Handler {
   }
 
   @Override
-  public Nullness onDataflowVisitMethodInvocation(
+  public NullnessHint onDataflowVisitMethodInvocation(
       MethodInvocationNode node,
       Types types,
+      AccessPathNullnessPropagation.SubNodeValues inputs,
       AccessPathNullnessPropagation.Updates thenUpdates,
       AccessPathNullnessPropagation.Updates elseUpdates,
       AccessPathNullnessPropagation.Updates bothUpdates) {
     // NoOp
-    return Nullness.NONNULL;
+    return NullnessHint.UNKNOWN;
   }
 
   @Override

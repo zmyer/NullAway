@@ -44,9 +44,12 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
   static final String FL_CLASS_ANNOTATIONS_TO_EXCLUDE =
       EP_FL_NAMESPACE + ":ExcludedClassAnnotations";
   static final String FL_SUGGEST_SUPPRESSIONS = EP_FL_NAMESPACE + ":SuggestSuppressions";
+  static final String FL_GENERATED_UNANNOTATED = EP_FL_NAMESPACE + ":TreatGeneratedAsUnannotated";
   static final String FL_EXCLUDED_FIELD_ANNOT = EP_FL_NAMESPACE + ":ExcludedFieldAnnotations";
   static final String FL_INITIALIZER_ANNOT = EP_FL_NAMESPACE + ":CustomInitializerAnnotations";
   static final String FL_CTNN_METHOD = EP_FL_NAMESPACE + ":CastToNonNullMethod";
+  static final String FL_EXTERNAL_INIT_ANNOT = EP_FL_NAMESPACE + ":ExternalInitAnnotations";
+  static final String FL_UNANNOTATED_CLASSES = EP_FL_NAMESPACE + ":UnannotatedClasses";
   private static final String DELIMITER = ",";
 
   static final ImmutableSet<String> DEFAULT_KNOWN_INITIALIZERS =
@@ -57,10 +60,18 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
           "android.app.Fragment.onCreate",
           "android.app.Application.onCreate",
           "javax.annotation.processing.Processor.init");
+
   static final ImmutableSet<String> DEFAULT_INITIALIZER_ANNOT =
       ImmutableSet.of(
           "org.junit.Before",
-          "org.junit.BeforeClass"); // + Anything with @Initializer as its "simple name"
+          "org.junit.BeforeClass",
+          "org.junit.jupiter.api.BeforeAll",
+          "org.junit.jupiter.api.BeforeEach"); // + Anything with @Initializer as its "simple name"
+
+  static final ImmutableSet<String> DEFAULT_EXCLUDED_FIELD_ANNOT =
+      ImmutableSet.of(
+          "javax.inject.Inject", // no explicit initialization when there is dependency injection
+          "com.google.errorprone.annotations.concurrent.LazyInit");
 
   ErrorProneCLIFlagsConfig(ErrorProneFlags flags) {
     if (!flags.get(FL_ANNOTATED_PACKAGES).isPresent()) {
@@ -73,16 +84,20 @@ final class ErrorProneCLIFlagsConfig extends AbstractConfig {
     annotatedPackages = getPackagePattern(getFlagStringSet(flags, FL_ANNOTATED_PACKAGES));
     unannotatedSubPackages = getPackagePattern(getFlagStringSet(flags, FL_UNANNOTATED_SUBPACKAGES));
     sourceClassesToExclude = getFlagStringSet(flags, FL_CLASSES_TO_EXCLUDE);
+    unannotatedClasses = getFlagStringSet(flags, FL_UNANNOTATED_CLASSES);
     knownInitializers =
         getKnownInitializers(
             getFlagStringSet(flags, FL_KNOWN_INITIALIZERS, DEFAULT_KNOWN_INITIALIZERS));
     excludedClassAnnotations = getFlagStringSet(flags, FL_CLASS_ANNOTATIONS_TO_EXCLUDE);
     initializerAnnotations =
         getFlagStringSet(flags, FL_INITIALIZER_ANNOT, DEFAULT_INITIALIZER_ANNOT);
+    externalInitAnnotations = getFlagStringSet(flags, FL_EXTERNAL_INIT_ANNOT);
     isExhaustiveOverride = flags.getBoolean(FL_EXHAUSTIVE_OVERRIDE).orElse(false);
     isSuggestSuppressions = flags.getBoolean(FL_SUGGEST_SUPPRESSIONS).orElse(false);
-    ImmutableSet<String> propStrings = getFlagStringSet(flags, FL_EXCLUDED_FIELD_ANNOT);
-    fieldAnnotPattern = propStrings.isEmpty() ? null : getPackagePattern(propStrings);
+    treatGeneratedAsUnannotated = flags.getBoolean(FL_GENERATED_UNANNOTATED).orElse(false);
+    fieldAnnotPattern =
+        getPackagePattern(
+            getFlagStringSet(flags, FL_EXCLUDED_FIELD_ANNOT, DEFAULT_EXCLUDED_FIELD_ANNOT));
     castToNonNullMethod = flags.get(FL_CTNN_METHOD).orElse(null);
   }
 

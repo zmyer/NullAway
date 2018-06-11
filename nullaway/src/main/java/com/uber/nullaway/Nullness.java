@@ -18,8 +18,9 @@
 
 package com.uber.nullaway;
 
+import com.sun.tools.javac.code.Symbol;
+import java.util.stream.Stream;
 import javax.lang.model.element.AnnotationMirror;
-import javax.lang.model.element.Element;
 import org.checkerframework.dataflow.analysis.AbstractValue;
 
 /**
@@ -40,7 +41,7 @@ public enum Nullness implements AbstractValue<Nullness> {
    *         Bottom
    * </pre>
    */
-  NULLABLE("Nullable"), // TODO(eaftan): Rename to POSSIBLY_NULL?
+  NULLABLE("Nullable"),
   NULL("Null"),
   NONNULL("Non-null"),
   BOTTOM("Bottom");
@@ -127,16 +128,36 @@ public enum Nullness implements AbstractValue<Nullness> {
     return displayName;
   }
 
-  private static Nullness nullnessFromAnnotations(Element element) {
-    for (AnnotationMirror anno : NullabilityUtil.getAllAnnotations(element)) {
-      if (anno.getAnnotationType().toString().endsWith(".Nullable")) {
-        return Nullness.NULLABLE;
-      }
-    }
-    return Nullness.NONNULL;
+  private static boolean hasNullableAnnotation(Stream<? extends AnnotationMirror> annotations) {
+    return annotations
+        .map(anno -> anno.getAnnotationType().toString())
+        .anyMatch(Nullness::isNullableAnnotation);
   }
 
-  public static boolean hasNullableAnnotation(Element element) {
-    return nullnessFromAnnotations(element) == Nullness.NULLABLE;
+  /**
+   * @param annotName annotation name
+   * @return true if we treat annotName as a <code>@Nullable</code> annotation, false otherwise
+   */
+  public static boolean isNullableAnnotation(String annotName) {
+    return annotName.endsWith(".Nullable")
+        || annotName.equals("org.checkerframework.checker.nullness.compatqual.NullableDecl");
+  }
+
+  /**
+   * Does the symbol have a {@code @Nullable} declaration or type-use annotation?
+   *
+   * <p>NOTE: this method does not work for checking all annotations of parameters of methods from
+   * class files. For that case, use {@link #paramHasNullableAnnotation(Symbol.MethodSymbol, int)}
+   */
+  public static boolean hasNullableAnnotation(Symbol symbol) {
+    return hasNullableAnnotation(NullabilityUtil.getAllAnnotations(symbol));
+  }
+
+  /**
+   * Does the parameter of {@code symbol} at {@code paramInd} have a {@code @Nullable} declaration
+   * or type-use annotation? This method works for methods defined in either source or class files.
+   */
+  public static boolean paramHasNullableAnnotation(Symbol.MethodSymbol symbol, int paramInd) {
+    return hasNullableAnnotation(NullabilityUtil.getAllAnnotationsForParameter(symbol, paramInd));
   }
 }

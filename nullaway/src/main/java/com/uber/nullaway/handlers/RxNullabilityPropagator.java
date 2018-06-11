@@ -34,6 +34,7 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.LiteralTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
@@ -43,20 +44,22 @@ import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Symbol;
 import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.tree.JCTree;
 import com.uber.nullaway.NullAway;
 import com.uber.nullaway.NullabilityUtil;
 import com.uber.nullaway.Nullness;
 import com.uber.nullaway.dataflow.AccessPath;
 import com.uber.nullaway.dataflow.AccessPathNullnessAnalysis;
 import com.uber.nullaway.dataflow.NullnessStore;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import org.checkerframework.dataflow.cfg.UnderlyingAST;
 import org.checkerframework.dataflow.cfg.node.LocalVariableNode;
 
@@ -76,10 +79,8 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
           // (must take exactly 1 argument)
           .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
           // Names and relevant arguments of all the methods of io.reactivex.Observable that behave
-          // like
-          // .map(...) for the purposes of this checker (the listed arguments are those that take
-          // the
-          // potentially filtered objects from the stream)
+          // like .map(...) for the purposes of this checker (the listed arguments are those that
+          // take the potentially filtered objects from the stream)
           .withMapMethodFromSignature(
               "<R>map(io.reactivex.functions.Function<? super T,? extends R>)",
               "apply",
@@ -91,14 +92,18 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
               "test",
               ImmutableSet.of(0, 1))
           // List of methods of io.reactivex.Observable through which we just propagate the
-          // nullability
-          // information of the last call, e.g. m() in Observable.filter(...).m().map(...) means the
+          // nullability information of the last call, e.g. m() in
+          // Observable.filter(...).m().map(...) means the
           // nullability information from filter(...) should still be propagated to map(...),
-          // ignoring the
-          // interleaving call to m().
+          // ignoring the interleaving call to m().
           .withPassthroughMethodFromSignature("distinct()")
           .withPassthroughMethodFromSignature("distinctUntilChanged()")
           .withPassthroughMethodAllFromName("observeOn")
+          // List of methods of io.reactivex.Observable that both use the nullability information
+          // internally (like map does), but also don't change the values flowing through the stream
+          // and thus propagate
+          // the nullability information of the last call.
+          .withUseAndPassthroughMethodAllFromName("doOnNext", "accept", ImmutableSet.of(0))
           .addStreamType(new DescendantOf(Suppliers.typeFromString("io.reactivex.Maybe")))
           .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
           .withMapMethodFromSignature(
@@ -108,6 +113,7 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
           .withMapMethodAllFromName("flatMap", "apply", ImmutableSet.of(0))
           .withMapMethodAllFromName("flatMapSingle", "apply", ImmutableSet.of(0))
           .withPassthroughMethodAllFromName("observeOn")
+          .withUseAndPassthroughMethodAllFromName("doOnNext", "accept", ImmutableSet.of(0))
           .addStreamType(new DescendantOf(Suppliers.typeFromString("io.reactivex.Single")))
           .withFilterMethodFromSignature("filter(io.reactivex.functions.Predicate<? super T>)")
           .withMapMethodFromSignature(
@@ -117,6 +123,7 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
           .withMapMethodAllFromName("flatMap", "apply", ImmutableSet.of(0))
           .withMapMethodAllFromName("flatMapSingle", "apply", ImmutableSet.of(0))
           .withPassthroughMethodAllFromName("observeOn")
+          .withUseAndPassthroughMethodAllFromName("doOnNext", "accept", ImmutableSet.of(0))
           .end();
 
   /* Terminology for this class internals:
@@ -183,8 +190,7 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
   // Map from filter method (or lambda) to corresponding nullability info after the function returns
   // true.
   // Specifically, this is the least upper bound of the "then" store on the branch of every return
-  // statement in
-  // which the expression after the return can be true.
+  // statement in which the expression after the return can be true.
   private final Map<Tree, NullnessStore<Nullness>> filterToNSMap =
       new LinkedHashMap<Tree, NullnessStore<Nullness>>();
 
@@ -259,8 +265,9 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
               handleMapAnonClass(methodRecord, tree, annonClassBody, state);
             }
           } else if (argTree instanceof LambdaExpressionTree) {
-            LambdaExpressionTree lambdaTree = (LambdaExpressionTree) argTree;
-            handleMapLambda(streamType, tree, lambdaTree, state);
+            observableCallToInnerMethodOrLambda.put(tree, (LambdaExpressionTree) argTree);
+          } else if (argTree instanceof MemberReferenceTree) {
+            observableCallToInnerMethodOrLambda.put(tree, (MemberReferenceTree) argTree);
           }
         }
       }
@@ -282,26 +289,29 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
       MethodInvocationTree observableDotFilter,
       Tree filterMethodOrLambda,
       VisitorState state) {
+    MethodInvocationTree outerCallInChain = observableDotFilter;
+    if (outerCallInChain == null) {
+      return;
+    }
     // Traverse the observable call chain out through any pass-through methods
-    MethodInvocationTree outerCallInChain = observableOuterCallInChain.get(observableDotFilter);
-    while (outerCallInChain != null
-        && streamType.matchesType(ASTHelpers.getReceiverType(outerCallInChain), state)
-        && streamType.isPassthroughMethod(ASTHelpers.getSymbol(outerCallInChain))) {
+    do {
       outerCallInChain = observableOuterCallInChain.get(outerCallInChain);
-    }
-    // Check for a map method
-    MethodInvocationTree mapCallsite = observableOuterCallInChain.get(observableDotFilter);
-    if (outerCallInChain != null
-        && observableCallToInnerMethodOrLambda.containsKey(outerCallInChain)) {
-      // Update mapToFilterMap
-      Symbol.MethodSymbol mapMethod = ASTHelpers.getSymbol(outerCallInChain);
-      if (streamType.isMapMethod(mapMethod)) {
-        MaplikeToFilterInstanceRecord record =
-            new MaplikeToFilterInstanceRecord(
-                streamType.getMaplikeMethodRecord(mapMethod), filterMethodOrLambda);
-        mapToFilterMap.put(observableCallToInnerMethodOrLambda.get(outerCallInChain), record);
+      // Check for a map method (which might be a pass-through method or the first method after a
+      // pass-through chain)
+      MethodInvocationTree mapCallsite = observableOuterCallInChain.get(observableDotFilter);
+      if (observableCallToInnerMethodOrLambda.containsKey(outerCallInChain)) {
+        // Update mapToFilterMap
+        Symbol.MethodSymbol mapMethod = ASTHelpers.getSymbol(outerCallInChain);
+        if (streamType.isMapMethod(mapMethod)) {
+          MaplikeToFilterInstanceRecord record =
+              new MaplikeToFilterInstanceRecord(
+                  streamType.getMaplikeMethodRecord(mapMethod), filterMethodOrLambda);
+          mapToFilterMap.put(observableCallToInnerMethodOrLambda.get(outerCallInChain), record);
+        }
       }
-    }
+    } while (outerCallInChain != null
+        && streamType.matchesType(ASTHelpers.getReceiverType(outerCallInChain), state)
+        && streamType.isPassthroughMethod(ASTHelpers.getSymbol(outerCallInChain)));
   }
 
   private void handleFilterAnonClass(
@@ -341,14 +351,6 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
     }
   }
 
-  private void handleMapLambda(
-      StreamTypeRecord streamType,
-      MethodInvocationTree observableDotMap,
-      LambdaExpressionTree lambdaTree,
-      VisitorState state) {
-    observableCallToInnerMethodOrLambda.put(observableDotMap, lambdaTree);
-  }
-
   @Override
   public void onMatchMethod(
       NullAway analysis, MethodTree tree, VisitorState state, Symbol.MethodSymbol methodSymbol) {
@@ -373,6 +375,48 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
     }
     if (mapToFilterMap.containsKey(tree)) {
       bodyToMethodOrLambda.put(tree.getBody(), tree);
+    }
+  }
+
+  @Override
+  public void onMatchMethodReference(
+      NullAway analysis,
+      MemberReferenceTree tree,
+      VisitorState state,
+      Symbol.MethodSymbol methodSymbol) {
+    if (mapToFilterMap.containsKey(tree) && ((JCTree.JCMemberReference) tree).kind.isUnbound()) {
+      // Unbound method reference, check if we know the corresponding path to be NonNull from the
+      // previous filter.
+      MaplikeToFilterInstanceRecord callInstanceRecord = mapToFilterMap.get(tree);
+      Tree filterTree = callInstanceRecord.getFilter();
+      assert (filterTree instanceof MethodTree || filterTree instanceof LambdaExpressionTree);
+      NullnessStore<Nullness> filterNullnessStore = filterToNSMap.get(filterTree);
+      assert filterNullnessStore != null;
+      for (AccessPath ap : filterNullnessStore.getAccessPathsWithValue(Nullness.NONNULL)) {
+        // Find the access path corresponding to the current unbound method reference after binding
+        ImmutableList<Element> elements = ap.getElements();
+        if (elements.size() == 1) {
+          // We only care for single method call chains (e.g. this.foo(), not this.f.bar())
+          Element element = elements.get(0);
+          if (!element.getKind().equals(ElementKind.METHOD)) {
+            // We are only looking for method APs
+            continue;
+          }
+          if (!element.getSimpleName().equals(methodSymbol.getSimpleName())) {
+            // Check for the name match
+            continue;
+          }
+          if (((ExecutableElement) element).getParameters().size() != 0) {
+            // Methods that take parameters might have return values that don't depend only on this
+            // and the AP
+            continue;
+          }
+          // We found our method, and it was non-null when called inside the filter, so we mark the
+          // return of the
+          // method reference as non-null here
+          analysis.setComputedNullness(tree, Nullness.NONNULL);
+        }
+      }
     }
   }
 
@@ -501,12 +545,12 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
 
     private final List<StreamTypeRecord> typeRecords = new LinkedList<StreamTypeRecord>();
     private TypePredicate tp = null;
-    private Set<String> filterMethodSigs;
-    private Set<String> filterMethodSimpleNames;
-    private Map<String, MaplikeMethodRecord> mapMethodSigToRecord;
-    private Map<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord;
-    private Set<String> passthroughMethodSigs;
-    private Set<String> passthroughMethodSimpleNames;
+    private ImmutableSet.Builder<String> filterMethodSigs;
+    private ImmutableSet.Builder<String> filterMethodSimpleNames;
+    private ImmutableMap.Builder<String, MaplikeMethodRecord> mapMethodSigToRecord;
+    private ImmutableMap.Builder<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord;
+    private ImmutableSet.Builder<String> passthroughMethodSigs;
+    private ImmutableSet.Builder<String> passthroughMethodSimpleNames;
 
     private StreamModelBuilder() {}
 
@@ -524,12 +568,12 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
         typeRecords.add(
             new StreamTypeRecord(
                 this.tp,
-                ImmutableSet.copyOf(filterMethodSigs),
-                ImmutableSet.copyOf(filterMethodSimpleNames),
-                ImmutableMap.copyOf(mapMethodSigToRecord),
-                ImmutableMap.copyOf(mapMethodSimpleNameToRecord),
-                ImmutableSet.copyOf(passthroughMethodSigs),
-                ImmutableSet.copyOf(passthroughMethodSimpleNames)));
+                filterMethodSigs.build(),
+                filterMethodSimpleNames.build(),
+                mapMethodSigToRecord.build(),
+                mapMethodSimpleNameToRecord.build(),
+                passthroughMethodSigs.build(),
+                passthroughMethodSimpleNames.build()));
       }
     }
 
@@ -542,12 +586,12 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
     public StreamModelBuilder addStreamType(TypePredicate tp) {
       finalizeOpenStreamTypeRecord();
       this.tp = tp;
-      this.filterMethodSigs = new HashSet<String>();
-      this.filterMethodSimpleNames = new HashSet<String>();
-      this.mapMethodSigToRecord = new HashMap<String, MaplikeMethodRecord>();
-      this.mapMethodSimpleNameToRecord = new HashMap<String, MaplikeMethodRecord>();
-      this.passthroughMethodSigs = new HashSet<String>();
-      this.passthroughMethodSimpleNames = new HashSet<String>();
+      this.filterMethodSigs = ImmutableSet.builder();
+      this.filterMethodSimpleNames = ImmutableSet.builder();
+      this.mapMethodSigToRecord = ImmutableMap.builder();
+      this.mapMethodSimpleNameToRecord = ImmutableMap.builder();
+      this.passthroughMethodSigs = ImmutableSet.builder();
+      this.passthroughMethodSimpleNames = ImmutableSet.builder();
       return this;
     }
 
@@ -638,6 +682,48 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
     }
 
     /**
+     * Add a passthrough method that uses the value to the last added stream type.
+     *
+     * <p>Like a normal passthrough method, but it takes a callback which inspects but doesn't
+     * change the elements flowing through the stream.
+     *
+     * @param passthroughMethodSig The full sub-signature (everything except the receiver type) of
+     *     the method.
+     * @param innerMethodName The name of the inner method of the callback or functional interface
+     *     that must be passed to this method.
+     * @param argsFromStream The indexes (starting at 0, not counting the receiver) of all the
+     *     arguments to this method that receive objects from the stream.
+     * @return This builder (for chaining).
+     */
+    public StreamModelBuilder withUseAndPassthroughMethodFromSignature(
+        String passthroughMethodSig, String innerMethodName, ImmutableSet<Integer> argsFromStream) {
+      this.mapMethodSigToRecord.put(
+          passthroughMethodSig, new MaplikeMethodRecord(innerMethodName, argsFromStream));
+      this.passthroughMethodSigs.add(passthroughMethodSig);
+      return this;
+    }
+
+    /**
+     * Add all methods of the last stream type with the given simple name as use-and-passthrough
+     * methods.
+     *
+     * @param methodSimpleName The method's simple name.
+     * @param innerMethodName The name of the inner method of the callback or functional interface
+     *     that must be passed to this method.
+     * @param argsFromStream The indexes (starting at 0, not counting the receiver) of all the
+     *     arguments to this method that receive objects from the stream. Must be the same for all
+     *     methods with this name (else use withUseAndPassthroughMethodFromSignature).
+     * @return This builder (for chaining).
+     */
+    public StreamModelBuilder withUseAndPassthroughMethodAllFromName(
+        String methodSimpleName, String innerMethodName, ImmutableSet<Integer> argsFromStream) {
+      this.mapMethodSimpleNameToRecord.put(
+          methodSimpleName, new MaplikeMethodRecord(innerMethodName, argsFromStream));
+      this.passthroughMethodSimpleNames.add(methodSimpleName);
+      return this;
+    }
+
+    /**
      * Turn the models added to this builder into a list of StreamTypeRecord objects.
      *
      * @return The finalized (immutable) models.
@@ -655,36 +741,32 @@ class RxNullabilityPropagator extends BaseNoOpHandler {
 
     // Names of all the methods of this type that behave like .filter(...) (must take exactly 1
     // argument)
-    private final Set<String> filterMethodSigs;
-    private final Set<String> filterMethodSimpleNames;
+    private final ImmutableSet<String> filterMethodSigs;
+    private final ImmutableSet<String> filterMethodSimpleNames;
 
     // Names and relevant arguments of all the methods of this type that behave like .map(...) for
-    // the
-    // purposes of this checker (the listed arguments are those that take the potentially filtered
-    // objects from the
-    // stream)
-    private final Map<String, MaplikeMethodRecord> mapMethodSigToRecord;
-    private final Map<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord;
+    // the purposes of this checker (the listed arguments are those that take the potentially
+    // filtered objects from the stream)
+    private final ImmutableMap<String, MaplikeMethodRecord> mapMethodSigToRecord;
+    private final ImmutableMap<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord;
 
     // List of methods of io.reactivex.Observable through which we just propagate the nullability
-    // information of the
-    // last call, e.g. m() in Observable.filter(...).m().map(...) means the nullability information
-    // from filter(...)
-    // should still be propagated to map(...), ignoring the interleaving call to m().
+    // information of the last call, e.g. m() in Observable.filter(...).m().map(...) means the
+    // nullability information from filter(...) should still be propagated to map(...), ignoring the
+    // interleaving call to m().
     // We assume that if m() is a pass-through method for Observable, so are m(a1), m(a1,a2), etc.
-    // If that is ever not
-    // the case, we can use a more complex method subsignature her.
-    private final Set<String> passthroughMethodSigs;
-    private final Set<String> passthroughMethodSimpleNames;
+    // If that is ever not the case, we can use a more complex method subsignature her.
+    private final ImmutableSet<String> passthroughMethodSigs;
+    private final ImmutableSet<String> passthroughMethodSimpleNames;
 
     public StreamTypeRecord(
         TypePredicate typePredicate,
-        Set<String> filterMethodSigs,
-        Set<String> filterMethodSimpleNames,
-        Map<String, MaplikeMethodRecord> mapMethodSigToRecord,
-        Map<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord,
-        Set<String> passthroughMethodSigs,
-        Set<String> passthroughMethodSimpleNames) {
+        ImmutableSet<String> filterMethodSigs,
+        ImmutableSet<String> filterMethodSimpleNames,
+        ImmutableMap<String, MaplikeMethodRecord> mapMethodSigToRecord,
+        ImmutableMap<String, MaplikeMethodRecord> mapMethodSimpleNameToRecord,
+        ImmutableSet<String> passthroughMethodSigs,
+        ImmutableSet<String> passthroughMethodSimpleNames) {
       this.typePredicate = typePredicate;
       this.filterMethodSigs = filterMethodSigs;
       this.filterMethodSimpleNames = filterMethodSimpleNames;

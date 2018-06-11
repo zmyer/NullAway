@@ -36,7 +36,6 @@ import javax.annotation.Nullable;
 /** abstract base class for null checker {@link Config} implementations */
 public abstract class AbstractConfig implements Config {
 
-  private static final Pattern NULLABLE_PATTERN = Pattern.compile("(?:(.*)\\.Nullable$)");
   /**
    * Packages that we assume have appropriate nullability annotations.
    *
@@ -53,20 +52,33 @@ public abstract class AbstractConfig implements Config {
    */
   protected Pattern unannotatedSubPackages;
 
-  /** Source code in these packages will not be analyzed for nullability issues */
+  /** Source code in these classes will not be analyzed for nullability issues */
   @Nullable protected ImmutableSet<String> sourceClassesToExclude;
 
-  @Nullable protected Pattern fieldAnnotPattern;
+  /**
+   * these classes will be treated as unannotated (don't analyze *and* treat methods as unannotated)
+   */
+  @Nullable protected ImmutableSet<String> unannotatedClasses;
+
+  protected Pattern fieldAnnotPattern;
 
   protected boolean isExhaustiveOverride;
 
   protected boolean isSuggestSuppressions;
+
+  /**
+   * if true, {@link #fromAnnotatedPackage(Symbol.ClassSymbol)} will return false for any class
+   * annotated with {@link javax.annotation.Generated}
+   */
+  protected boolean treatGeneratedAsUnannotated;
 
   protected Set<MethodClassAndName> knownInitializers;
 
   protected Set<String> excludedClassAnnotations;
 
   protected Set<String> initializerAnnotations;
+
+  protected Set<String> externalInitAnnotations;
 
   @Nullable protected String castToNonNullMethod;
 
@@ -79,9 +91,12 @@ public abstract class AbstractConfig implements Config {
   }
 
   @Override
-  public boolean fromAnnotatedPackage(String className) {
+  public boolean fromAnnotatedPackage(Symbol.ClassSymbol symbol) {
+    String className = symbol.getQualifiedName().toString();
     return annotatedPackages.matcher(className).matches()
-        && !unannotatedSubPackages.matcher(className).matches();
+        && !unannotatedSubPackages.matcher(className).matches()
+        && (!treatGeneratedAsUnannotated
+            || !ASTHelpers.hasDirectAnnotationWithSimpleName(symbol, "Generated"));
   }
 
   @Override
@@ -90,6 +105,20 @@ public abstract class AbstractConfig implements Config {
       return false;
     }
     for (String classPrefix : sourceClassesToExclude) {
+      if (className.startsWith(classPrefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public boolean isUnannotatedClass(Symbol.ClassSymbol symbol) {
+    if (unannotatedClasses == null) {
+      return false;
+    }
+    String className = symbol.getQualifiedName().toString();
+    for (String classPrefix : unannotatedClasses) {
       if (className.startsWith(classPrefix)) {
         return true;
       }
@@ -123,7 +152,7 @@ public abstract class AbstractConfig implements Config {
 
   @Override
   public boolean isExcludedFieldAnnotation(String annotationName) {
-    return NULLABLE_PATTERN.matcher(annotationName).matches()
+    return Nullness.isNullableAnnotation(annotationName)
         || (fieldAnnotPattern != null && fieldAnnotPattern.matcher(annotationName).matches());
   }
 
@@ -136,6 +165,11 @@ public abstract class AbstractConfig implements Config {
   @Nullable
   public String getCastToNonNullMethod() {
     return castToNonNullMethod;
+  }
+
+  @Override
+  public boolean isExternalInitClassAnnotation(String annotationName) {
+    return externalInitAnnotations.contains(annotationName);
   }
 
   protected Set<MethodClassAndName> getKnownInitializers(Set<String> qualifiedNames) {
